@@ -14,7 +14,7 @@
 
 import Fuse from "fuse.js";
 import { FUSE_OPTIONS, SEARCH_KEYS } from "./constants.js";
-import type { ToolRanking } from "./types.js";
+import type { SearchBackend, ToolRanking } from "./types.js";
 
 // ── Minimal tool descriptor ──────────────────────────────────────
 
@@ -25,7 +25,7 @@ export interface IndexedTool {
 
 // ── SearchEngine ─────────────────────────────────────────────────
 
-export class SearchEngine {
+export class SearchEngine implements SearchBackend {
   private fuse: Fuse<IndexedTool>;
   private catalogHash: string;
 

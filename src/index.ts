@@ -18,7 +18,7 @@ interface AutocompleteItem {
   label: string;
   description?: string;
 }
-import { BACKEND_ID, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
+import { BACKEND_ID, COMMAND_NAME, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
 import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
 import { getGlobalConfigPath, getProjectConfigPath } from "./config.js";
 import { handleToolbeltCommand } from "./commands.js";
@@ -56,7 +56,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── /toolbelt command ──────────────────────────────────────────
-  pi.registerCommand("toolbelt", {
+  pi.registerCommand(COMMAND_NAME, {
     description: "Toolbelt: setup, status, and reset progressive tool discovery",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const trimmed = prefix.trimStart();
@@ -113,7 +113,8 @@ export default function (pi: ExtensionAPI) {
       // Hot-reload: always re-evaluate config after command so manual
       // edits and setup/reset are reflected immediately without a new
       // session. This is the only place currentEffectiveConfig is
-      // updated outside of session_start.
+      // updated outside of session_start. If session_start gating
+      // logic evolves, this path must be updated in lockstep.
       const fresh = buildEffectiveConfig(ctx.cwd);
       currentEffectiveConfig = isEnabled(fresh) ? fresh : null;
     },

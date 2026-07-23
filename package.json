@@ -24,8 +24,7 @@
     "benchmark": "tsx benchmark/index.ts"
   },
   "dependencies": {
-    "fuse.js": "^7.0.0",
-    "typebox": "^1.1.38"
+    "fuse.js": "^7.0.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.7"

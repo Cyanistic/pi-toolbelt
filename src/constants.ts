@@ -9,7 +9,7 @@ export const CONFIG_FILE_NAME = "toolbelt.json";
 /** The loader tool that must always remain active when Toolbelt is enabled. */
 export const LOADER_TOOL_NAME = "query_tools";
 
-/** Command name for the /toolbelt slash command. */
+/** Command name for the /toolbelt slash command. Used by index.ts registration. */
 export const COMMAND_NAME = "toolbelt";
 
 /** Backend identifier embedded in search receipts. */

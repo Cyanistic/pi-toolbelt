@@ -14,7 +14,7 @@ import {
   hasConfigError,
   isEnabled,
 } from "./config.js";
-import { BACKEND_ID, DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
+import { BACKEND_ID, COMMAND_NAME, DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
 import type { SearchReceipt, ToolbeltConfig } from "./types.js";
 import { isSearchReceipt } from "./session.js";
 
@@ -156,7 +156,7 @@ function buildSetupConfirm(
     "",
     `Config file: ${targetPath}`,
     `Baseline tools: ${config.baseline.join(", ")}`,
-    `Search tool: query_tools (always active)`,
+    `Search tool: ${LOADER_TOOL_NAME} (always active)`,
     `Threshold: ${config.threshold}  |  Top-K: ${config.topK}`,
     "",
     "Baseline tools + query_tools will be activated immediately.",
@@ -329,8 +329,10 @@ async function handleReset(
       },
     );
   } catch {
-    // appendEntry not available — marker not persisted; resume may
-    // restore tools from before the reset. Non-critical for v1.
+    ctx.ui.notify(
+      "[toolbelt] reset marker not persisted — pre-reset tools may restore on resume",
+      "warning",
+    );
   }
 
   if (removed.length > 0) {

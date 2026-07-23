@@ -10,8 +10,8 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { readToolbeltConfig, isEnabled, hasConfigError } from "../config.js";
-import type { EffectiveConfig } from "../types.js";
+import { readToolbeltConfig, buildEffectiveConfig, writeToolbeltConfig, isEnabled, hasConfigError } from "../config.js";
+import type { EffectiveConfig, ToolbeltConfig } from "../types.js";
 
 const tmpBase = join(tmpdir(), `pi-toolbelt-test-${process.pid}`);
 
@@ -183,5 +183,60 @@ describe("hasConfigError", () => {
       hasConfigError({ ...base, source: "none", globalError: "bad" }),
       true,
     );
+  });
+});
+
+// ── buildEffectiveConfig (merge logic) ───────────────────────────
+
+describe("buildEffectiveConfig", () => {
+  it("falls back to defaults when project config is partial", () => {
+    setupTmp();
+    const piDir = join(tmpBase, ".pi");
+    mkdirSync(piDir, { recursive: true });
+    writeFileSync(join(piDir, "toolbelt.json"), JSON.stringify({ threshold: 0.1 }), "utf-8");
+    const result = buildEffectiveConfig(tmpBase);
+    // baseline falls through to whatever global/default provides
+    assert.ok(Array.isArray(result.baseline));
+    assert.equal(result.threshold, 0.1);
+    assert.ok(result.topK > 0);
+    teardownTmp();
+  });
+
+  it("project error disables", () => {
+    setupTmp();
+    const piDir = join(tmpBase, ".pi");
+    mkdirSync(piDir, { recursive: true });
+    writeFileSync(join(piDir, "toolbelt.json"), "{ invalid json }", "utf-8");
+    const result = buildEffectiveConfig(tmpBase);
+    assert.equal(isEnabled(result), false);
+    assert.ok(result.projectError);
+    teardownTmp();
+  });
+});
+
+// ── writeToolbeltConfig (error paths) ────────────────────────────
+
+describe("writeToolbeltConfig", () => {
+  it("throws on unwritable path", () => {
+    assert.throws(() => {
+      writeToolbeltConfig("/dev/null/toolbelt.json", {
+        baseline: ["read"],
+        threshold: 0.4,
+        topK: 5,
+      });
+    });
+  });
+
+  it("writes and can be read back", () => {
+    setupTmp();
+    const p = join(tmpBase, "test-config.json");
+    const config: ToolbeltConfig = { baseline: ["bash"], threshold: 0.5, topK: 3 };
+    writeToolbeltConfig(p, config);
+    const result = readToolbeltConfig(p);
+    assert.ok(result.config);
+    assert.deepEqual(result.config.baseline, ["bash"]);
+    assert.equal(result.config.threshold, 0.5);
+    assert.equal(result.config.topK, 3);
+    teardownTmp();
   });
 });
