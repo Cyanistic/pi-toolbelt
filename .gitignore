@@ -1,0 +1,28 @@
+node_modules/
+dist/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+benchmark/results/
+
+# Debug logs
+*.log
+npm-debug.log*
+.research/
+.pi/
+.rpiv/artifacts/handoffs/

@@ -1,0 +1,44 @@
+{
+  "name": "pi-toolbelt",
+  "version": "0.1.0",
+  "description": "Progressive tool discovery for Pi — carry only the tools you need",
+  "type": "module",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "coding-agent",
+    "tool-search",
+    "dynamic-tools"
+  ],
+  "author": "Cyanism",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/__tests__/**/*.test.ts",
+    "benchmark": "tsx benchmark/index.ts"
+  },
+  "dependencies": {
+    "fuse.js": "^7.0.0",
+    "typebox": "^1.1.38"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.7"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.7",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.5.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
