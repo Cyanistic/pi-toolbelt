@@ -4,6 +4,10 @@
 
 import { SearchEngine, buildToolIndex } from "../src/search.js";
 import { BACKEND_ID } from "../src/constants.js";
+import {
+  filterToolRows,
+  type ToolManagerRow,
+} from "../src/tool-manager.js";
 
 const DESCRIPTIONS = [
   "Read file contents from disk", "Execute bash commands",
@@ -48,5 +52,36 @@ for (let i = 0; i < ITERATIONS; i++) {
 
 latencies.sort((a, b) => a - b);
 const p95 = latencies[P95_INDEX];
-console.log(`p95: ${p95.toFixed(3)} ms — ${p95 < 100 ? "PASS" : "FAIL"}`);
-if (p95 >= 100) process.exit(1);
+console.log(`search p95: ${p95.toFixed(3)} ms - ${p95 < 100 ? "PASS" : "FAIL"}`);
+if (p95 >= 100) process.exitCode = 1;
+
+// ── Modal filter benchmark ──────────────────────────────────────
+
+const MODAL_ROWS: ToolManagerRow[] = FIXTURE_TOOLS.map((tool) => ({ ...tool }));
+const FILTERS = [
+  "browser",
+  "files",
+  "web",
+  "agent",
+  "questions",
+  "tool_09",
+  "no-match",
+];
+for (let i = 0; i < 50; i++) {
+  filterToolRows(MODAL_ROWS, FILTERS[i % FILTERS.length]);
+}
+
+const filterLatencies: number[] = [];
+for (let i = 0; i < ITERATIONS; i++) {
+  const t0 = performance.now();
+  filterToolRows(MODAL_ROWS, FILTERS[i % FILTERS.length]);
+  filterLatencies.push(performance.now() - t0);
+}
+filterLatencies.sort((a, b) => a - b);
+const filterP95 = filterLatencies[P95_INDEX];
+console.log(
+  `modal filter p95: ${filterP95.toFixed(3)} ms - ${
+    filterP95 < 100 ? "PASS" : "FAIL"
+  }`,
+);
+if (filterP95 >= 100) process.exitCode = 1;

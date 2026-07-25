@@ -38,14 +38,40 @@ export interface SearchBackend {
   getCatalogHash(): string;
 }
 
-/** Durable receipt persisted in tool result details. */
-export interface SearchReceipt {
+/** Complete active-set state persisted in custom session entry. */
+export interface ActiveToolSnapshot {
+  version: 1;
+  active: string[];
+}
+
+/** Observable result of one persisted active-set replacement. */
+export interface ActiveToolChange {
+  before: string[];
+  after: string[];
+  added: string[];
+  removed: string[];
+}
+
+/** A ranked discovery result annotated with current active membership. */
+export interface ToolDiscoveryResult extends ToolRanking {
+  active: boolean;
+}
+
+/** Discovery-only receipt persisted in query_tools result details. */
+export interface DiscoveryReceipt {
   query: string;
   backend: string;
-  rankings: ToolRanking[];
-  activated: string[];
+  rankings: ToolDiscoveryResult[];
   activeCounts: { before: number; after: number };
   catalogHash: string;
+}
+
+export type ToolManagementAction = "activate" | "deactivate";
+
+/** Details returned by one explicit model-side active-set mutation. */
+export interface ToolManagementReceipt extends ActiveToolChange {
+  action: ToolManagementAction;
+  requested: string[];
 }
 
 /** Result from reading a single config file. */

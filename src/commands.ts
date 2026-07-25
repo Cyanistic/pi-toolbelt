@@ -5,7 +5,7 @@
  * Each subcommand is a named handler dispatched from the top-level command.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   getGlobalConfigPath,
   getProjectConfigPath,
@@ -15,19 +15,17 @@ import {
   isEnabled,
 } from "./config.js";
 import { BACKEND_ID, COMMAND_NAME, DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
-import type { SearchReceipt, ToolbeltConfig } from "./types.js";
-import { isSearchReceipt } from "./session.js";
+import type { DiscoveryReceipt, ToolbeltConfig } from "./types.js";
+import {
+  filterRegisteredTools,
+  isDiscoveryReceipt,
+  persistActiveTools,
+} from "./session.js";
+import { openToolManager } from "./tool-manager.js";
 
 // ── Types ─────────────────────────────────────────────────────────
 
-interface CommandContext {
-  cwd: string;
-  hasUI: boolean;
-  ui: {
-    notify(msg: string, sev: "info" | "warning" | "error"): void;
-    confirm(title: string, body: string): Promise<boolean>;
-  };
-}
+type CommandContext = ExtensionCommandContext;
 
 // ── Top-level dispatch ────────────────────────────────────────────
 
@@ -49,23 +47,27 @@ export async function handleToolbeltCommand(
       ctx.ui.notify(
         "Toolbelt commands:\n" +
           "  /toolbelt setup [global|project]  — create config and apply baseline\n" +
-          "  /toolbelt status                    — show current state\n" +
-          "  /toolbelt reset                     — clear search-activated tools",
+          "  /toolbelt tools                   — inspect and change session tools\n" +
+          "  /toolbelt status                  — show current state\n" +
+          "  /toolbelt reset                   — restore configured baseline",
         "info",
       );
       break;
     case "setup":
       await handleSetup(parts.slice(1), pi, ctx);
       break;
+    case "tools":
+      await handleTools(pi, ctx);
+      break;
     case "status":
-      await handleStatus(pi, ctx as Parameters<typeof handleStatus>[1]);
+      await handleStatus(pi, ctx);
       break;
     case "reset":
       await handleReset(pi, ctx);
       break;
     default:
       ctx.ui.notify(
-        `Unknown subcommand: ${subcommand}. Valid subcommands: setup, status, reset`,
+        `Unknown subcommand: ${subcommand}. Valid subcommands: setup, tools, status, reset`,
         "warning",
       );
   }
@@ -138,8 +140,19 @@ async function handleSetup(
 
   // Apply immediately: re-read effective config (includes what was just written)
   const newEffective = buildEffectiveConfig(ctx.cwd);
-  const active = [...new Set([...newEffective.baseline, LOADER_TOOL_NAME])];
-  pi.setActiveTools(active);
+  const requested = filterRegisteredTools(pi, newEffective.baseline);
+  let active: string[];
+  try {
+    active = persistActiveTools(pi, requested).after;
+  } catch (error) {
+    ctx.ui.notify(
+      `Config was written, but active tools were not changed because the session snapshot could not be persisted: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "error",
+    );
+    return;
+  }
 
   const debug = !!pi.getFlag(FLAG_DEBUG);
   ctx.ui.notify(buildSetupReport(targetPath, newEffective, active, debug), "info");
@@ -156,10 +169,10 @@ function buildSetupConfirm(
     "",
     `Config file: ${targetPath}`,
     `Baseline tools: ${config.baseline.join(", ")}`,
-    `Search tool: ${LOADER_TOOL_NAME} (always active)`,
+    `Discovery tool: ${LOADER_TOOL_NAME} (active only when included in baseline or enabled for the session)`,
     `Threshold: ${config.threshold}  |  Top-K: ${config.topK}`,
     "",
-    "Baseline tools + query_tools will be activated immediately.",
+    "The configured baseline will be activated immediately.",
     "Proceed?",
   ];
   return lines.join("\n");
@@ -187,22 +200,49 @@ function buildSetupReport(
   return lines.join("\n");
 }
 
+// ── Tools modal ───────────────────────────────────────────────────
+
+async function handleTools(
+  pi: ExtensionAPI,
+  ctx: CommandContext,
+): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("/toolbelt tools requires TUI mode", "error");
+    return;
+  }
+
+  const effective = buildEffectiveConfig(ctx.cwd);
+  const result = await openToolManager(
+    ctx,
+    pi.getAllTools(),
+    pi.getActiveTools(),
+    !isEnabled(effective),
+  );
+  if (result.kind === "cancel") return;
+
+  try {
+    const change = persistActiveTools(pi, result.active);
+    ctx.ui.notify(
+      change.added.length === 0 && change.removed.length === 0
+        ? `Toolbelt tools: active set unchanged (${change.after.length} tools).`
+        : `Toolbelt tools applied. Active: ${change.after.join(", ") || "none"}.`,
+      "info",
+    );
+  } catch (error) {
+    ctx.ui.notify(
+      `Toolbelt tools not applied; active tools were unchanged because the session snapshot could not be persisted: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "error",
+    );
+  }
+}
+
 // ── Status ────────────────────────────────────────────────────────
 
 async function handleStatus(
   pi: ExtensionAPI,
-  ctx: {
-    cwd: string;
-    ui: {
-      notify(msg: string, sev: "info" | "warning" | "error"): void;
-    };
-    sessionManager?: {
-      getBranch(): Array<{
-        type: string;
-        message?: { role: string; toolName?: string; details?: unknown };
-      }>;
-    };
-  },
+  ctx: CommandContext,
 ): Promise<void> {
   const effective = buildEffectiveConfig(ctx.cwd);
 
@@ -217,22 +257,19 @@ async function handleStatus(
   const active = pi.getActiveTools();
   const registered = pi.getAllTools();
 
-  // Find last query_tools receipt on branch
-  let lastReceipt: SearchReceipt | undefined;
-  const branch =
-    ctx.sessionManager?.getBranch?.() ?? [];
+  // Find last query_tools discovery receipt on branch
+  let lastReceipt: DiscoveryReceipt | undefined;
+  const branch = ctx.sessionManager?.getBranch?.() ?? [];
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
     if (
       entry.type === "message" &&
       entry.message?.role === "toolResult" &&
-      entry.message?.toolName === LOADER_TOOL_NAME
+      entry.message?.toolName === LOADER_TOOL_NAME &&
+      isDiscoveryReceipt(entry.message.details)
     ) {
-      const d = entry.message.details as SearchReceipt | undefined;
-      if (isSearchReceipt(d)) {
-        lastReceipt = d;
-        break;
-      }
+      lastReceipt = entry.message.details;
+      break;
     }
   }
 
@@ -245,37 +282,38 @@ async function handleStatus(
     lines.push("Toolbelt: enabled");
     lines.push(`Config: ${configPaths.join(", ")}`);
     lines.push(`Source: ${effective.source}`);
-    lines.push(`Baseline: ${effective.baseline.join(", ")}`);
+    lines.push(`Baseline: ${effective.baseline.join(", ") || "(none)"}`);
     lines.push(
-      `Active: ${active.length} / ${registered.length} registered`,
+      `Backend: ${BACKEND_ID} | threshold: ${effective.threshold} | topK: ${effective.topK}`,
     );
-    lines.push(
-      `Backend: ${BACKEND_ID}  |  threshold: ${effective.threshold}  |  topK: ${effective.topK}`,
-    );
-  } else {
+  } else if (hasConfigError(effective)) {
     lines.push("Toolbelt: disabled (config has errors)");
     const errors: string[] = [];
     if (effective.globalError) errors.push(effective.globalError);
     if (effective.projectError) errors.push(effective.projectError);
-    if (errors.length > 0)
-      lines.push(`Errors: ${errors.join("; ")}`);
+    if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
+  } else {
     lines.push(
-      `Active: ${active.length} / ${registered.length} registered`,
+      "Toolbelt: disabled - no config files found. Run /toolbelt setup to enable changes.",
     );
   }
+
+  lines.push(`Active: ${active.length} / ${registered.length} registered`);
+  lines.push(`Active names: ${active.join(", ") || "(none)"}`);
 
   if (lastReceipt) {
     lines.push("");
     lines.push(`Last search: "${lastReceipt.query}"`);
-    if (lastReceipt.activated.length > 0) {
-      const scores = lastReceipt.rankings
-        .filter((r) => lastReceipt!.activated.includes(r.name))
-        .map((r) => `${r.name} (${r.score.toFixed(3)})`)
-        .join(", ");
-      lines.push(`  → activated: ${scores}`);
-    } else {
-      lines.push(`  → no tools activated`);
-    }
+    lines.push(
+      lastReceipt.rankings.length > 0
+        ? `  matches: ${lastReceipt.rankings
+            .map(
+              ({ name, score, active }) =>
+                `${name} (${active ? "active" : "inactive"}, ${score.toFixed(3)})`,
+            )
+            .join(", ")}`
+        : "  no ranked tools",
+    );
   }
 
   ctx.ui.notify(lines.join("\n"), "info");
@@ -285,15 +323,9 @@ async function handleStatus(
 
 async function handleReset(
   pi: ExtensionAPI,
-  ctx: {
-    cwd: string;
-    ui: {
-      notify(msg: string, sev: "info" | "warning" | "error"): void;
-    };
-  },
+  ctx: CommandContext,
 ): Promise<void> {
   const effective = buildEffectiveConfig(ctx.cwd);
-
   if (!isEnabled(effective)) {
     ctx.ui.notify(
       "Toolbelt: disabled (no valid config). Nothing to reset.",
@@ -302,50 +334,32 @@ async function handleReset(
     return;
   }
 
-  const beforeNames = pi.getActiveTools();
-  const newSet = [...new Set([...effective.baseline, LOADER_TOOL_NAME])];
-  const removed = beforeNames.filter((n) => !newSet.includes(n));
-
-  pi.setActiveTools(newSet);
-
-  // Persist reset-marker receipt: record a custom entry on the session
-  // that restoreFromBranch detects. The next query_tools call would
-  // also generate a receipt, but reset must leave a durable marker
-  // regardless. Use pi.appendEntry if available (ExtensionAPI method).
+  const requested = filterRegisteredTools(pi, effective.baseline);
+  let change;
   try {
-    (pi as { appendEntry?: (type: string, payload: Record<string, unknown>) => void }).appendEntry?.(
-      "tool_result",
-      {
-        toolName: LOADER_TOOL_NAME,
-        role: "toolResult",
-        details: {
-          query: "/toolbelt reset",
-          backend: BACKEND_ID,
-          rankings: [],
-          activated: [],
-          activeCounts: { before: beforeNames.length, after: newSet.length },
-          catalogHash: "",
-        } satisfies SearchReceipt,
-      },
-    );
-  } catch {
+    change = persistActiveTools(pi, requested);
+  } catch (error) {
     ctx.ui.notify(
-      "[toolbelt] reset marker not persisted — pre-reset tools may restore on resume",
-      "warning",
+      `Toolbelt reset aborted; active tools were not changed because the session snapshot could not be persisted: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "error",
     );
+    return;
   }
 
-  if (removed.length > 0) {
-    ctx.ui.notify(
-      `✓ Toolbelt reset\n\n` +
-        `Removed: ${removed.join(", ")}\n` +
-        `Active: ${newSet.length} tools (${newSet.join(", ")})`,
-      "warning",
+  if (change.removed.length > 0 || change.added.length > 0) {
+    const lines = ["✓ Toolbelt reset"];
+    if (change.added.length > 0) lines.push(`Added: ${change.added.join(", ")}`);
+    if (change.removed.length > 0) lines.push(`Removed: ${change.removed.join(", ")}`);
+    lines.push(
+      `Active: ${change.after.length} tools (${change.after.join(", ") || "none"})`,
     );
+    ctx.ui.notify(lines.join("\n"), "warning");
   } else {
     ctx.ui.notify(
-      `Toolbelt reset: nothing to remove. ` +
-        `Active: ${newSet.length} tools unchanged.`,
+      `Toolbelt reset: nothing to change. ` +
+        `Active: ${change.after.length} tools unchanged.`,
       "info",
     );
   }

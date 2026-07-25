@@ -1,13 +1,10 @@
 /**
- * pi-toolbelt — Progressive tool discovery extension for Pi.
+ * pi-toolbelt: discovery and explicit session tool management for Pi.
  *
- * Registers one model-facing tool (query_tools) and one slash command
- * family (/toolbelt) unconditionally at module load. The session_start
- * handler gates all active-set management behind config-file presence
- * and validity — installing the package alone never alters active tools.
- *
- * Follows rpiv-core/index.ts:46-48 unconditional-registration pattern
- * and pi-powerline-footer standalone package structure.
+ * Registers query_tools, manage_tools, and the /toolbelt command family
+ * unconditionally. Config validity gates every active-set mutation, while the
+ * tools command remains available read-only before setup. Session start applies
+ * the registered configured baseline or the newest exact active-set snapshot.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,13 +15,19 @@ interface AutocompleteItem {
   label: string;
   description?: string;
 }
-import { BACKEND_ID, COMMAND_NAME, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
+import { BACKEND_ID, COMMAND_NAME, FLAG_DEBUG, LOADER_TOOL_NAME, MANAGE_TOOL_NAME } from "./constants.js";
 import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
 import { getGlobalConfigPath, getProjectConfigPath } from "./config.js";
 import { handleToolbeltCommand } from "./commands.js";
-import type { SearchReceipt } from "./types.js";
+import type {
+  DiscoveryReceipt,
+  ToolDiscoveryResult,
+  ToolManagementAction,
+  ToolManagementReceipt,
+  ToolRanking,
+} from "./types.js";
 import { SearchEngine, buildToolIndex } from "./search.js";
-import { applyBaseline, restoreFromBranch } from "./session.js";
+import { filterRegisteredTools, persistActiveTools, restoreActiveToolSnapshot } from "./session.js";
 
 /** Completion tree: each node maps a token to the next level. */
 interface CompletionNode {
@@ -41,8 +44,9 @@ const COMPS: Record<string, CompletionNode> = {
       project: { description: "Write .pi/toolbelt.json" },
     },
   },
+  tools: { description: "Inspect and change active session tools" },
   status: { description: "Show current toolbelt state" },
-  reset: { description: "Clear search-activated tools" },
+  reset: { description: "Restore configured baseline" },
 };
 
 export default function (pi: ExtensionAPI) {
@@ -57,7 +61,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /toolbelt command ──────────────────────────────────────────
   pi.registerCommand(COMMAND_NAME, {
-    description: "Toolbelt: setup, status, and reset progressive tool discovery",
+    description: "Toolbelt: setup, inspect, manage, status, and reset session tools",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const trimmed = prefix.trimStart();
       const tokens = trimmed.split(/\s+/);
@@ -120,129 +124,212 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── query_tools tool ──────────────────────────────────────────
+  function annotateActiveState(
+    rankings: ToolRanking[],
+    activeNames: readonly string[],
+  ): ToolDiscoveryResult[] {
+    const active = new Set(activeNames);
+    return rankings.map((ranking) => ({
+      ...ranking,
+      active: active.has(ranking.name),
+    }));
+  }
+
+  function formatDiscoveryResults(rankings: ToolDiscoveryResult[]): string {
+    return rankings
+      .map(
+        ({ name, score, active }) =>
+          `${name} (${active ? "active" : "inactive"}, ${score.toFixed(3)})`,
+      )
+      .join(", ");
+  }
+
+  // ── query_tools tool (discovery-only) ─────────────────────────
   pi.registerTool({
     name: LOADER_TOOL_NAME,
     label: "Query Tools",
     description:
-      "Discover and activate additional tools beyond your current set. " +
-      "Describe a concrete capability you need (e.g. \"fetch a URL\", \"search the web\", " +
-      "\"generate an image\") and matching tools are automatically added to your available " +
-      "toolset. Activated tools are callable immediately.\n\n" +
-      "HOW TO USE: think of a task you want to do, then describe that task or capability. " +
-      "Do NOT ask to \"list\" or \"show all\" tools — the system searches by capability, " +
-      "not by enumeration. If a search returns no matches, broaden the capability description.",
+      "Discover registered tools by capability without changing the active set. " +
+      `Results include current active state. Use ${MANAGE_TOOL_NAME} to activate or deactivate exact names.\n\n` +
+      "HOW TO USE: describe a concrete capability or task. Do not ask to list every tool; " +
+      "search by capability and broaden the query if no result clears the configured threshold.",
     parameters: {
       type: "object",
       properties: {
         query: {
           type: "string",
           description:
-            "Concrete capability or task you need a tool for (e.g. \"search the web\", " +
-            "\"read a PDF\", \"execute code\"). Do NOT ask to list or enumerate tools.",
+            "Concrete capability or task to find a registered tool for, such as web search or PDF reading",
         },
       },
       required: ["query"],
     },
     async execute(_toolCallId, params) {
       const query = String(params.query ?? "");
+      const active = pi.getActiveTools();
 
-      // Disabled mode: no valid config → return empty receipt, no activation
       if (!currentEffectiveConfig) {
-        const active = pi.getActiveTools();
         return {
           content: [
             {
               type: "text",
               text:
                 "Toolbelt is not yet configured. " +
-                "Run /toolbelt setup to enable progressive tool discovery.",
+                "Run /toolbelt setup to enable tool discovery.",
             },
           ],
           details: {
             query,
             backend: BACKEND_ID,
             rankings: [],
-            activated: [],
             activeCounts: { before: active.length, after: active.length },
             catalogHash: "",
-          },
+          } satisfies DiscoveryReceipt,
         };
       }
 
       const { threshold, topK } = currentEffectiveConfig;
-
-      // Build or refresh tool index
-      const allTools = pi.getAllTools();
-      const indexed = buildToolIndex(allTools);
+      const indexed = buildToolIndex(pi.getAllTools());
       if (!searchEngine) {
         searchEngine = new SearchEngine(indexed);
       } else {
         searchEngine.refresh(indexed);
       }
 
-      // Search
-      const rankings = searchEngine.search(query, threshold, topK);
-
-      // No matches above threshold — return near-misses for debugging
-      if (rankings.length === 0) {
-        const active = pi.getActiveTools();
-        // Re-search with threshold 1.0 for near-misses
-        const allRanked = searchEngine.search(query, 1.0, topK);
+      const ranked = searchEngine.search(query, threshold, topK);
+      if (ranked.length === 0) {
+        const nearMisses = annotateActiveState(
+          searchEngine.search(query, 1.0, topK),
+          active,
+        );
         return {
           content: [
             {
               type: "text",
               text:
                 `No tools matched "${query}" above threshold ${threshold}. ` +
-                (allRanked.length > 0
-                  ? `Near misses: ${allRanked.map((r) => r.name).join(", ")}`
+                (nearMisses.length > 0
+                  ? `Near misses: ${formatDiscoveryResults(nearMisses)}`
                   : "No ranking results found."),
             },
           ],
           details: {
             query,
             backend: BACKEND_ID,
-            rankings: allRanked,
-            activated: [],
+            rankings: nearMisses,
             activeCounts: { before: active.length, after: active.length },
             catalogHash: searchEngine.getCatalogHash(),
-          },
+          } satisfies DiscoveryReceipt,
         };
       }
 
-      // Additive activation: merge matched names with current active set.
-      const activeBefore = pi.getActiveTools();
-      const matched = rankings.map((r) => r.name);
-      const newSet = [...new Set([...activeBefore, ...matched])];
-      pi.setActiveTools(newSet);
-
-      const activeAfter = pi.getActiveTools();
-      const activated = matched.filter((n) => !activeBefore.includes(n));
-
+      const rankings = annotateActiveState(ranked, active);
       return {
         content: [
           {
             type: "text",
             text:
-              activated.length > 0
-                ? `Activated tools: ${activated.join(", ")}. ` +
-                  `Now ${activeAfter.length} tools active (was ${activeBefore.length}).`
-                : `Matching tools already active: ${matched.join(", ")}`,
+              `Matching registered tools: ${formatDiscoveryResults(rankings)}. ` +
+              `Use ${MANAGE_TOOL_NAME} with an exact tool name to change membership.`,
           },
         ],
         details: {
           query,
           backend: BACKEND_ID,
           rankings,
-          activated,
-          activeCounts: {
-            before: activeBefore.length,
-            after: activeAfter.length,
-          },
+          activeCounts: { before: active.length, after: active.length },
           catalogHash: searchEngine.getCatalogHash(),
+        } satisfies DiscoveryReceipt,
+      };
+    },
+  });
+
+  // ── manage_tools tool (explicit model-side mutation) ──────────
+  pi.registerTool({
+    name: MANAGE_TOOL_NAME,
+    label: "Manage Tools",
+    description:
+      "Activate or deactivate registered Pi tools by exact name. Performs one direction per call, " +
+      "persists the complete final active set before applying it, and never executes the target tools. " +
+      "Any registered tool, including query_tools and manage_tools, may be deactivated.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["activate", "deactivate"],
+          description: "Whether to activate or deactivate every supplied tool name",
         },
-      } satisfies { content: Array<{ type: "text"; text: string }>; details: SearchReceipt };
+        tools: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          description: "One or more exact registered tool names",
+        },
+      },
+      required: ["action", "tools"],
+    },
+    async execute(_toolCallId, params) {
+      if (!currentEffectiveConfig) {
+        throw new Error(
+          "Toolbelt is not configured. Run /toolbelt setup before changing active tools.",
+        );
+      }
+
+      const action = String(params.action ?? "") as ToolManagementAction;
+      if (action !== "activate" && action !== "deactivate") {
+        throw new Error(`Invalid tool-management action: ${String(params.action)}`);
+      }
+
+      const requested = Array.isArray(params.tools)
+        ? [...new Set(params.tools.filter((name): name is string => typeof name === "string"))]
+        : [];
+      if (requested.length === 0) {
+        throw new Error("At least one exact registered tool name is required.");
+      }
+
+      const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+      const unknown = requested.filter((name) => !registered.has(name));
+      if (unknown.length > 0) {
+        throw new Error(`Unknown registered tool names: ${unknown.join(", ")}`);
+      }
+
+      const before = pi.getActiveTools();
+      const requestedSet = new Set(requested);
+      const target =
+        action === "activate"
+          ? [...new Set([...before, ...requested])]
+          : before.filter((name) => !requestedSet.has(name));
+
+      let change;
+      try {
+        change = persistActiveTools(pi, target);
+      } catch (error) {
+        throw new Error(
+          `Failed to persist active-tool snapshot; no tools were changed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+
+      const changed = action === "activate" ? change.added : change.removed;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              changed.length > 0
+                ? `${action === "activate" ? "Activated" : "Deactivated"}: ${changed.join(", ")}. ` +
+                  `Active tools: ${change.after.join(", ") || "(none)"}.`
+                : `No tools changed. Active tools: ${change.after.join(", ") || "(none)"}.`,
+          },
+        ],
+        details: {
+          action,
+          requested,
+          ...change,
+        } satisfies ToolManagementReceipt,
+      };
     },
   });
 
@@ -251,67 +338,39 @@ export default function (pi: ExtensionAPI) {
     const effective = buildEffectiveConfig(ctx.cwd);
     const debug = !!pi.getFlag(FLAG_DEBUG);
 
-    // ── Check for config errors (always warn) ──
     if (hasConfigError(effective)) {
-      const errors: string[] = [];
-      if (effective.globalError) errors.push(effective.globalError);
-      if (effective.projectError) errors.push(effective.projectError);
+      const errors = [effective.globalError, effective.projectError].filter(
+        (error): error is string => typeof error === "string",
+      );
       ctx.ui.notify(`[toolbelt] ${errors.join("; ")}`, "warning");
-      // isEnabled returns false when errors exist (FRD FR#8).
     }
 
-    // ── Disabled mode ──
     if (!isEnabled(effective)) {
-      currentEffectiveConfig = null; // block query_tools
+      currentEffectiveConfig = null;
       if (debug) {
-        ctx.ui.notify(
-          "[toolbelt] disabled — no valid config found",
-          "info",
-        );
+        ctx.ui.notify("[toolbelt] disabled - no valid config found", "info");
       }
       return;
     }
 
-    // ── Enabled mode ──
     currentEffectiveConfig = effective;
-
-    // Detect resume: session_start event with reason === "resume"
     const isResume =
       event &&
       typeof event === "object" &&
       "reason" in event &&
       (event as { reason: string }).reason === "resume";
+    const configuredBaseline = filterRegisteredTools(pi, effective.baseline);
+    const restored = isResume ? restoreActiveToolSnapshot(pi, ctx) : undefined;
+    const active = restored ?? configuredBaseline;
+    pi.setActiveTools(active);
 
-    if (isResume) {
-      // Restore baseline + previously activated tools from branch
-      const restored = restoreFromBranch(pi, ctx);
-      const active = [
-        ...new Set([
-          ...effective.baseline,
-          LOADER_TOOL_NAME,
-          ...restored,
-        ]),
-      ];
-      pi.setActiveTools(active);
-
-      if (debug) {
-        ctx.ui.notify(
-          `[toolbelt] resume: baseline (${effective.baseline.length}) + ` +
-            `restored (${restored.length}) = ${active.length} active tools`,
-          "info",
-        );
-      }
-    } else {
-      // New session: baseline only
-      applyBaseline(pi, effective);
-
-      if (debug) {
-        ctx.ui.notify(
-          `[toolbelt] activated baseline: ${effective.baseline.join(", ")} ` +
-            `(source: ${effective.source})`,
-          "info",
-        );
-      }
+    if (debug) {
+      ctx.ui.notify(
+        isResume
+          ? `[toolbelt] resume: ${active.length} active tools from ${restored ? "snapshot" : "configured baseline"}`
+          : `[toolbelt] configured baseline active: ${active.join(", ")} (source: ${effective.source})`,
+        "info",
+      );
     }
   });
 }

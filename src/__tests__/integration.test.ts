@@ -1,8 +1,8 @@
 /**
  * Integration tests for the pi-toolbelt extension.
  *
- * Tests module interactions: config write/read round-trip, search pipeline
- * composition, disabled-mode guard, session resume with reset boundary.
+ * Tests the full lifecycle: discovery-only query_tools, explicit manage_tools,
+ * snapshot-based session restore, reset, validation, and persistence failure.
  */
 
 import { describe, it } from "node:test";
@@ -11,11 +11,13 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { writeToolbeltConfig, readToolbeltConfig, isEnabled, hasConfigError } from "../config.js";
+import toolbeltExtension from "../index.js";
+import {
+  ACTIVE_TOOL_SNAPSHOT_ENTRY,
+  MANAGE_TOOL_NAME,
+} from "../constants.js";
+import { writeToolbeltConfig } from "../config.js";
 import { SearchEngine, buildToolIndex } from "../search.js";
-import { applyBaseline, restoreFromBranch } from "../session.js";
-import type { ToolbeltConfig, EffectiveConfig } from "../types.js";
-import { DEFAULT_CONFIG, LOADER_TOOL_NAME } from "../constants.js";
 
 const tmpBase = join(tmpdir(), `pi-toolbelt-int-${process.pid}`);
 
@@ -28,355 +30,332 @@ function teardownTmp() {
   rmSync(tmpBase, { recursive: true, force: true });
 }
 
-// ── Disabled mode invariant ──────────────────────────────────────
+function createExtensionHarness(cwd: string) {
+  const registeredTools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const events = new Map<string, (...args: any[]) => any>();
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const operationOrder: string[] = [];
+  let active: string[] = [];
+  let setCalls = 0;
+  let failAppend = false;
+  let branch: any[] = [];
+  const catalog = [
+    { name: "read", description: "Read file contents" },
+    { name: "query_tools", description: "Discover registered tools" },
+    { name: MANAGE_TOOL_NAME, description: "Manage active tools" },
+    { name: "agent_browser", description: "Browse and interact with websites" },
+  ];
+  const pi = {
+    registerFlag() {},
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    registerTool(definition: any) {
+      registeredTools.set(definition.name, definition);
+    },
+    on(name: string, handler: (...args: any[]) => any) {
+      events.set(name, handler);
+    },
+    getFlag: () => false,
+    getAllTools: () => catalog,
+    getActiveTools: () => [...active],
+    setActiveTools(names: string[]) {
+      operationOrder.push("set");
+      setCalls++;
+      active = [...names];
+    },
+    appendEntry(type: string, data: unknown) {
+      operationOrder.push("append");
+      if (failAppend) throw new Error("disk full");
+      entries.push({ type, data });
+      branch.push({ type: "custom", customType: type, data });
+    },
+  } as any;
+  toolbeltExtension(pi);
 
-describe("Disabled mode invariant", () => {
-  it("no config → isEnabled returns false → baseline not applied", () => {
-    const effective: EffectiveConfig = {
-      ...DEFAULT_CONFIG,
-      source: "none",
-      globalPath: "/tmp/nonexistent.json",
-      projectPath: "/tmp/nonexistent.json",
-      globalValid: false,
-      projectValid: false,
-    };
-
-    assert.equal(isEnabled(effective), false);
-
-    // Guard check: if isEnabled is false, applyBaseline should not be called
-    let setActiveCalled = false;
-    const mockPi = {
-      setActiveTools: () => {
-        setActiveCalled = true;
-      },
-      getActiveTools: () => [],
-      getAllTools: () => [],
-    } as any;
-
-    if (isEnabled(effective)) {
-      applyBaseline(mockPi, effective);
-    }
-    assert.equal(setActiveCalled, false, "setActiveTools must not be called when disabled");
+  const context = () => ({
+    cwd,
+    hasUI: true,
+    ui: { notify() {}, confirm: async () => true },
+    sessionManager: { getBranch: () => branch },
   });
 
-  it("config with errors → isEnabled returns false → hasConfigError returns true", () => {
-    const effective: EffectiveConfig = {
-      ...DEFAULT_CONFIG,
-      source: "none",
-      globalPath: "/tmp/bad.json",
-      projectPath: "/tmp/bad.json",
-      globalValid: false,
-      projectValid: false,
-      globalError: "Invalid JSON in /tmp/bad.json: Unexpected token",
-    };
+  return {
+    registeredTools,
+    commands,
+    entries,
+    operationOrder,
+    get active() { return [...active]; },
+    get setCalls() { return setCalls; },
+    set failAppend(value: boolean) { failAppend = value; },
+    set branch(value: any[]) { branch = value; },
+    async start(reason = "new") {
+      await events.get("session_start")?.({ reason }, context());
+    },
+    async command(args: string) {
+      await commands.get("toolbelt").handler(args, context());
+    },
+  };
+}
 
-    assert.equal(isEnabled(effective), false);
-    assert.equal(hasConfigError(effective), true);
-  });
+// ── Registered model tool workflow ──────────────────────────────
 
-  it("valid global config → isEnabled returns true", () => {
-    const effective: EffectiveConfig = {
-      baseline: ["read", "bash"],
-      threshold: 0.4,
-      topK: 5,
-      source: "global",
-      globalPath: "/tmp/valid.json",
-      projectPath: "/tmp/nonexistent.json",
-      globalValid: true,
-      projectValid: false,
-    };
-
-    assert.equal(isEnabled(effective), true);
-    assert.equal(hasConfigError(effective), false);
-  });
-});
-
-// ── Config write/read round-trip ─────────────────────────────────
-
-describe("Config write/read round-trip", () => {
-  it("writes then reads back identical config via explicit path", () => {
+describe("registered model tool workflow", () => {
+  it("query_tools returns active markers without mutating the active set", async () => {
     setupTmp();
-    const p = join(tmpBase, "toolbelt.json");
-    const config: ToolbeltConfig = {
-      baseline: ["read", "bash", "edit", "write"],
-      threshold: 0.3,
-      topK: 10,
-    };
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read", "query_tools", MANAGE_TOOL_NAME],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    const before = harness.active;
+    const setCallsBefore = harness.setCalls;
+    const result = await harness.registeredTools
+      .get("query_tools")
+      .execute("call-1", { query: "browse websites" });
 
-    writeToolbeltConfig(p, config);
-    const result = readToolbeltConfig(p);
-
-    assert.ok(result.config, "config must be read back");
-    assert.equal(result.error, undefined, "no error on valid config");
-    assert.deepEqual(result.config!.baseline, ["read", "bash", "edit", "write"]);
-    assert.equal(result.config!.threshold, 0.3);
-    assert.equal(result.config!.topK, 10);
-
+    assert.deepEqual(harness.active, before);
+    assert.equal(harness.setCalls, setCallsBefore);
+    assert.deepEqual(result.details.activeCounts, {
+      before: before.length,
+      after: before.length,
+    });
+    assert.ok(
+      result.details.rankings.some(
+        (ranking: any) =>
+          ranking.name === "agent_browser" && ranking.active === false,
+      ),
+    );
     teardownTmp();
   });
 
-  it("missing file returns undefined config without error", () => {
-    const result = readToolbeltConfig("/tmp/nonexistent-toolbelt-test.json");
-    assert.equal(result.config, undefined);
-    assert.equal(result.error, undefined);
-  });
-});
-
-// ── Search pipeline composition ──────────────────────────────────
-
-describe("Search pipeline integration", () => {
-  const SAMPLE_TOOLS = [
-    { name: "agent_browser", description: "Browse and interact with websites using a headful browser" },
-    { name: "web_search", description: "Search the web for current information" },
-    { name: "read", description: "Read file contents" },
-    { name: "bash", description: "Execute bash commands" },
-    { name: "edit", description: "Edit files with text replacement" },
-  ];
-
-  it("buildToolIndex → SearchEngine → search returns ranked results", () => {
-    const indexed = buildToolIndex(SAMPLE_TOOLS);
-    assert.equal(indexed.length, SAMPLE_TOOLS.length);
-
-    const engine = new SearchEngine(indexed);
-    const results = engine.search("browse", 0.6, 5);
-
-    assert.ok(results.length > 0, "should find browser-related tools");
-    const names = results.map((r) => r.name);
-    assert.ok(names.includes("agent_browser"), "agent_browser should rank high for 'browse'");
-    for (const r of results) {
-      assert.ok(r.score >= 0 && r.score <= 1, `score ${r.score} must be in [0,1]`);
-    }
-  });
-
-  it("no-match query returns empty regardless of topK", () => {
-    const indexed = buildToolIndex(SAMPLE_TOOLS);
-    const engine = new SearchEngine(indexed);
-    const results = engine.search("zzz_no_match_xyz", 0.8, 100);
-    assert.equal(results.length, 0);
-  });
-
-  it("threshold filter works as expected with borderline scores", () => {
-    const indexed = buildToolIndex(SAMPLE_TOOLS);
-    const engine = new SearchEngine(indexed);
-
-    // Strict threshold should return few/zero results
-    const strict = engine.search("file", 0.1, 5);
-    const lenient = engine.search("file", 0.6, 5);
-
-    // Lenient should return at least as many as strict
-    assert.ok(lenient.length >= strict.length);
-  });
-
-  it("search → additive activation produces correct active set", () => {
-    const indexed = buildToolIndex(SAMPLE_TOOLS);
-    const engine = new SearchEngine(indexed);
-
-    // Simulate what index.ts does
-    const results = engine.search("browse", 0.6, 5);
-    const activeBefore = ["read", "bash", "edit", "write", "query_tools"];
-    const matched = results.map((r) => r.name);
-    const newSet = [...new Set([...activeBefore, ...matched])];
-    const activated = matched.filter((n) => !activeBefore.includes(n));
-
-    assert.ok(newSet.includes("agent_browser"), "agent_browser should be in new active set");
-    assert.ok(activated.includes("agent_browser"), "agent_browser should be listed as activated");
-    assert.ok(newSet.includes("read"), "baseline tools must be preserved");
-  });
-
-  it("catalog hash changes when tools change", () => {
-    const indexed1 = buildToolIndex(SAMPLE_TOOLS);
-    const engine = new SearchEngine(indexed1);
-    const hash1 = engine.getCatalogHash();
-
-    const modifiedTools = [...SAMPLE_TOOLS, { name: "new_tool", description: "Brand new tool" }];
-    const indexed2 = buildToolIndex(modifiedTools);
-    assert.ok(engine.refresh(indexed2), "refresh should detect change");
-    assert.notEqual(engine.getCatalogHash(), hash1, "hash should differ after refresh");
-  });
-});
-
-// ── Session resume ───────────────────────────────────────────────
-
-describe("Session resume integration", () => {
-  it("restoreFromBranch correctly reconstructs activated tools after reset boundary", () => {
-    const mockPi = {
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-        { name: "web_search", description: "Search web" },
-        { name: "grep", description: "Search files" },
-      ],
-    } as any;
-
-    // Branch entries: oldest first (index 0), newest last
-    const branch = [
-      // index 0 — agent_browser activated (before reset)
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "browser",
-            backend: "fuse.js",
-            rankings: [{ name: "agent_browser", score: 0.12 }],
-            activated: ["agent_browser"],
-            activeCounts: { before: 5, after: 6 },
-            catalogHash: "abc",
-          },
-        },
-      },
-      // index 1 — reset marker
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "/toolbelt reset",
-            backend: "fuse.js",
-            rankings: [],
-            activated: [],
-            activeCounts: { before: 6, after: 5 },
-            catalogHash: "",
-          },
-        },
-      },
-      // index 2 — web_search activated (after reset, newest)
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "web search",
-            backend: "fuse.js",
-            rankings: [{ name: "web_search", score: 0.1 }],
-            activated: ["web_search"],
-            activeCounts: { before: 5, after: 6 },
-            catalogHash: "def",
-          },
-        },
-      },
-    ];
-
-    const mockCtx = { sessionManager: { getBranch: () => branch } } as any;
-    const result = restoreFromBranch(mockPi, mockCtx);
-
-    // Should only restore web_search (after reset), not agent_browser (before reset)
-    assert.deepEqual(
-      result.sort(),
-      ["web_search"],
-      "should only restore tools activated after the most recent reset",
-    );
-  });
-
-  it("restoreFromBranch works with no reset marker", () => {
-    const mockPi = {
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-        { name: "grep", description: "Search files" },
-      ],
-    } as any;
-
-    const branch = [
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "browser",
-            backend: "fuse.js",
-            rankings: [{ name: "agent_browser", score: 0.12 }],
-            activated: ["agent_browser"],
-            activeCounts: { before: 5, after: 6 },
-            catalogHash: "abc",
-          },
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "find files",
-            backend: "fuse.js",
-            rankings: [{ name: "grep", score: 0.2 }],
-            activated: ["grep"],
-            activeCounts: { before: 6, after: 7 },
-            catalogHash: "def",
-          },
-        },
-      },
-    ];
-
-    const mockCtx = { sessionManager: { getBranch: () => branch } } as any;
-    const result = restoreFromBranch(mockPi, mockCtx);
-
-    assert.deepEqual(result.sort(), ["agent_browser", "grep"]);
-  });
-});
-
-// ── Apply baseline + resume composition ──────────────────────────
-
-describe("Baseline + resume composition", () => {
-  it("applyBaseline then restoreFromBranch produces correct combined active set", () => {
-    let activeSet: string[] = [];
-
-    const mockPi = {
-      setActiveTools(names: string[]) {
-        activeSet = names;
-      },
-      getActiveTools: () => activeSet,
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-        { name: "grep", description: "Search files" },
-      ],
-    } as any;
-
-    const effective: EffectiveConfig = {
-      baseline: ["read", "bash", "edit", "write"],
-      threshold: 0.4,
+  it("manage_tools persists before mutation and can deactivate both model tools", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read", "query_tools", MANAGE_TOOL_NAME],
+      threshold: 0.8,
       topK: 5,
-      source: "global",
-      globalPath: "/tmp/a.json",
-      projectPath: "/tmp/b.json",
-      globalValid: true,
-      projectValid: false,
-    };
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    harness.operationOrder.length = 0;
+    const manage = harness.registeredTools.get(MANAGE_TOOL_NAME);
 
-    // Phase 1: new session — apply baseline
-    applyBaseline(mockPi, effective);
-    assert.deepEqual(activeSet, ["read", "bash", "edit", "write", "query_tools"]);
+    await manage.execute("call-2", {
+      action: "activate",
+      tools: ["agent_browser"],
+    });
+    assert.deepEqual(harness.operationOrder, ["append", "set"]);
 
-    // Phase 2: resume — restore tools from branch and merge with baseline
-    const branch = [
+    harness.operationOrder.length = 0;
+    await manage.execute("call-3", {
+      action: "deactivate",
+      tools: ["query_tools"],
+    });
+    assert.equal(harness.active.includes("query_tools"), false);
+
+    harness.operationOrder.length = 0;
+    await manage.execute("call-4", {
+      action: "deactivate",
+      tools: [MANAGE_TOOL_NAME],
+    });
+    assert.equal(harness.active.includes(MANAGE_TOOL_NAME), false);
+    teardownTmp();
+  });
+
+  it("uses configured baseline when no snapshot exists and exact snapshot on resume", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read"],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    assert.deepEqual(harness.active, ["read"]);
+
+    harness.branch = [
       {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "query_tools",
-          details: {
-            query: "browser",
-            backend: "fuse.js",
-            rankings: [{ name: "agent_browser", score: 0.12 }],
-            activated: ["agent_browser"],
-            activeCounts: { before: 5, after: 6 },
-            catalogHash: "abc",
-          },
-        },
+        type: "custom",
+        customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+        data: { version: 1, active: ["agent_browser"] },
+      },
+    ];
+    await harness.start("resume");
+    assert.deepEqual(harness.active, ["agent_browser"]);
+    teardownTmp();
+  });
+
+  it("reset persists configured baseline before applying it", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read"],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    await harness.registeredTools.get(MANAGE_TOOL_NAME).execute("call-5", {
+      action: "activate",
+      tools: ["agent_browser"],
+    });
+    harness.operationOrder.length = 0;
+
+    await harness.command("reset");
+
+    assert.deepEqual(harness.operationOrder, ["append", "set"]);
+    assert.deepEqual(harness.active, ["read"]);
+    assert.deepEqual(harness.entries.at(-1), {
+      type: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+      data: { version: 1, active: ["read"] },
+    });
+    teardownTmp();
+  });
+
+  it("rejects unknown names and aborts on snapshot failure", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read", MANAGE_TOOL_NAME],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    harness.operationOrder.length = 0;
+    const manage = harness.registeredTools.get(MANAGE_TOOL_NAME);
+
+    await assert.rejects(
+      manage.execute("call-6", {
+        action: "activate",
+        tools: ["missing_tool"],
+      }),
+      /Unknown registered tool names/,
+    );
+    assert.deepEqual(harness.operationOrder, []);
+
+    const before = harness.active;
+    harness.failAppend = true;
+    await assert.rejects(
+      manage.execute("call-7", {
+        action: "activate",
+        tools: ["agent_browser"],
+      }),
+      /no tools were changed: disk full/,
+    );
+    assert.deepEqual(harness.operationOrder, ["append"]);
+    assert.deepEqual(harness.active, before);
+    teardownTmp();
+  });
+});
+
+// ── Discovery-only invariant ────────────────────────────────────
+
+it("search ranking can be inspected without composing a new active set", () => {
+  const sampleTools = [
+    { name: "agent_browser", description: "Browse and interact with websites" },
+    { name: "web_search", description: "Search the web" },
+    { name: "read", description: "Read file contents" },
+  ];
+  const indexed = buildToolIndex(sampleTools);
+  const engine = new SearchEngine(indexed);
+  const results = engine.search("browse", 0.6, 5);
+  const activeBefore = ["read", "query_tools"];
+  const active = new Set(activeBefore);
+  const discovery = results.map((result) => ({
+    ...result,
+    active: active.has(result.name),
+  }));
+
+  assert.deepEqual(activeBefore, ["read", "query_tools"]);
+  assert.ok(
+    discovery.some(
+      (result) => result.name === "agent_browser" && result.active === false,
+    ),
+  );
+});
+
+// ── Phase 4: resume, reset, status lifecycle ──────────────────────
+
+describe("Phase 4 lifecycle", () => {
+  it("does not resurrect configured or management tools removed from the latest snapshot", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read", "query_tools", MANAGE_TOOL_NAME],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    await harness.start();
+    const manage = harness.registeredTools.get(MANAGE_TOOL_NAME);
+    await manage.execute("remove-read", {
+      action: "deactivate",
+      tools: ["read"],
+    });
+    await manage.execute("remove-query", {
+      action: "deactivate",
+      tools: ["query_tools"],
+    });
+    await manage.execute("remove-manage", {
+      action: "deactivate",
+      tools: [MANAGE_TOOL_NAME],
+    });
+    assert.deepEqual(harness.active, []);
+
+    await harness.start("resume");
+    assert.deepEqual(harness.active, []);
+    teardownTmp();
+  });
+
+  it("setup persists and applies only registered default-baseline names", async () => {
+    setupTmp();
+    const harness = createExtensionHarness(tmpBase);
+    await harness.command("setup project");
+    assert.deepEqual(harness.operationOrder, ["append", "set"]);
+    assert.deepEqual(harness.active, ["read", "query_tools", "manage_tools"]);
+    assert.deepEqual(harness.entries.at(-1), {
+      type: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+      data: { version: 1, active: ["read", "query_tools", "manage_tools"] },
+    });
+    teardownTmp();
+  });
+
+  it("uses configured registered baseline when resume has no snapshot", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read", "missing"],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    harness.branch = [];
+
+    await harness.start("resume");
+
+    assert.deepEqual(harness.active, ["read"]);
+    teardownTmp();
+  });
+
+  it("filters unregistered names from the newest snapshot on resume", async () => {
+    setupTmp();
+    writeToolbeltConfig(join(tmpBase, ".pi", "toolbelt.json"), {
+      baseline: ["read"],
+      threshold: 0.8,
+      topK: 5,
+    });
+    const harness = createExtensionHarness(tmpBase);
+    harness.branch = [
+      {
+        type: "custom",
+        customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+        data: { version: 1, active: ["agent_browser", "gone"] },
       },
     ];
 
-    const mockCtx = { sessionManager: { getBranch: () => branch } } as any;
-    const restored = restoreFromBranch(mockPi, mockCtx);
-    const combined = [...new Set([...effective.baseline, LOADER_TOOL_NAME, ...restored])];
-    mockPi.setActiveTools(combined);
-
-    assert.ok(combined.includes("read"), "baseline tools preserved");
-    assert.ok(combined.includes("query_tools"), "loader tool always present");
-    assert.ok(combined.includes("agent_browser"), "restored tools included");
-    assert.equal(combined.length, 6, "total: 4 baseline + query_tools + 1 restored");
+    await harness.start("resume");
+    assert.deepEqual(harness.active, ["agent_browser"]);
+    teardownTmp();
   });
 });

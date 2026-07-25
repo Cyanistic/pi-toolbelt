@@ -1,423 +1,203 @@
 /**
- * Session unit tests.
- *
- * Tests isSearchReceipt type guard, applyBaseline, and restoreFromBranch
- * branch-scanning logic including reset-marker boundary.
+ * Session unit tests for snapshot, discovery-receipt, and filtering helpers.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isSearchReceipt, applyBaseline, restoreFromBranch } from "../session.js";
-import type { SearchReceipt, EffectiveConfig } from "../types.js";
+import {
+  filterRegisteredTools,
+  isActiveToolSnapshot,
+  isDiscoveryReceipt,
+  persistActiveTools,
+  restoreActiveToolSnapshot,
+} from "../session.js";
+import { ACTIVE_TOOL_SNAPSHOT_ENTRY } from "../constants.js";
 
-// ── isSearchReceipt ──────────────────────────────────────────────
+const registered = ["read", "query_tools", "manage_tools", "agent_browser"];
+const tools = () => registered.map((name) => ({ name, description: name }));
 
-describe("isSearchReceipt", () => {
-  it("returns false for null", () => {
-    assert.equal(isSearchReceipt(null), false);
+// ── active-set snapshots ─────────────────────────────────────────
+
+describe("active-set snapshots", () => {
+  it("validates snapshot version and string names", () => {
+    assert.equal(isActiveToolSnapshot({ version: 1, active: ["read"] }), true);
+    assert.equal(isActiveToolSnapshot({ version: 1, active: [] }), true);
+    assert.equal(isActiveToolSnapshot({ version: 2, active: ["read"] }), false);
+    assert.equal(isActiveToolSnapshot({ version: 1, active: [7] }), false);
+    assert.equal(isActiveToolSnapshot(null), false);
+    assert.equal(isActiveToolSnapshot({ version: 1, active: "read" }), false);
   });
 
-  it("returns false for undefined", () => {
-    assert.equal(isSearchReceipt(undefined), false);
-  });
-
-  it("returns false for primitive values", () => {
-    assert.equal(isSearchReceipt("string"), false);
-    assert.equal(isSearchReceipt(42), false);
-    assert.equal(isSearchReceipt(true), false);
-  });
-
-  it("returns false for array", () => {
-    assert.equal(isSearchReceipt([]), false);
-  });
-
-  it("rejects object missing query field", () => {
-    assert.equal(
-      isSearchReceipt({
-        backend: "fuse.js",
-        rankings: [],
-        activated: [],
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
+  it("filters unknown names and preserves requested order", () => {
+    assert.deepEqual(
+      filterRegisteredTools(
+        { getAllTools: tools } as any,
+        ["manage_tools", "missing", "read", "read"],
+      ),
+      ["manage_tools", "read"],
     );
   });
 
-  it("rejects non-string query", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: 123,
-        backend: "fuse.js",
-        rankings: [],
-        activated: [],
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects non-string backend", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: 123,
-        rankings: [],
-        activated: [],
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects non-array rankings", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: "fuse.js",
-        rankings: "not-array",
-        activated: [],
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects non-array activated", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: "fuse.js",
-        rankings: [],
-        activated: "not-array",
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects missing activeCounts", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: "fuse.js",
-        rankings: [],
-        activated: [],
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects non-number activeCounts.before", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: "fuse.js",
-        rankings: [],
-        activated: [],
-        activeCounts: { before: "5", after: 7 },
-        catalogHash: "abc",
-      }),
-      false,
-    );
-  });
-
-  it("rejects non-string catalogHash", () => {
-    assert.equal(
-      isSearchReceipt({
-        query: "test",
-        backend: "fuse.js",
-        rankings: [],
-        activated: [],
-        activeCounts: { before: 5, after: 7 },
-        catalogHash: 123,
-      }),
-      false,
-    );
-  });
-
-  it("accepts valid SearchReceipt", () => {
-    const receipt: SearchReceipt = {
-      query: "browser automation",
-      backend: "fuse.js",
-      rankings: [{ name: "agent_browser", score: 0.12 }],
-      activated: ["agent_browser"],
-      activeCounts: { before: 5, after: 6 },
-      catalogHash: "abc123",
-    };
-    assert.equal(isSearchReceipt(receipt), true);
-  });
-});
-
-// ── applyBaseline ────────────────────────────────────────────────
-
-describe("applyBaseline", () => {
-  it("applies baseline plus query_tools and returns active set", () => {
-    let calledWith: string[] | null = null;
-    const mockPi = {
+  it("persists before replacing and aborts on persistence failure", () => {
+    const order: string[] = [];
+    let active = ["read"];
+    const pi = {
+      getAllTools: tools,
+      getActiveTools: () => [...active],
+      appendEntry() {
+        order.push("append");
+      },
       setActiveTools(names: string[]) {
-        calledWith = names;
+        order.push("set");
+        active = names;
       },
-      getActiveTools: () => [],
-      getAllTools: () => [],
     } as any;
+    persistActiveTools(pi, ["agent_browser"]);
+    assert.deepEqual(order, ["append", "set"]);
+    assert.deepEqual(active, ["agent_browser"]);
 
-    const effective: EffectiveConfig = {
-      baseline: ["read", "bash", "edit", "write"],
-      threshold: 0.4,
-      topK: 5,
-      source: "global",
-      globalPath: "/tmp/a.json",
-      projectPath: "/tmp/b.json",
-      globalValid: true,
-      projectValid: false,
-    };
+    let setCalls = 0;
+    const failing = {
+      getAllTools: tools,
+      getActiveTools: () => ["read"],
+      appendEntry() {
+        throw new Error("disk full");
+      },
+      setActiveTools() {
+        setCalls++;
+      },
+    } as any;
+    assert.throws(() => persistActiveTools(failing, []), /disk full/);
+    assert.equal(setCalls, 0);
+  });
 
-    const result = applyBaseline(mockPi, effective);
-    assert.deepEqual(calledWith, [
-      "read",
-      "bash",
-      "edit",
-      "write",
-      "query_tools",
-    ]);
-    assert.deepEqual(result, [
-      "read",
-      "bash",
-      "edit",
-      "write",
-      "query_tools",
-    ]);
+  it("restores the newest valid snapshot, including an exact empty set", () => {
+    const pi = { getAllTools: tools } as any;
+    const ctx = {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "custom",
+            customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+            data: { version: 1, active: ["read"] },
+          },
+          {
+            type: "custom",
+            customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+            data: { version: 1, active: [] },
+          },
+        ],
+      },
+    } as any;
+    assert.deepEqual(restoreActiveToolSnapshot(pi, ctx), []);
+  });
+
+  it("skips malformed snapshots and filters removed registrations", () => {
+    const pi = { getAllTools: tools } as any;
+    const ctx = {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "custom",
+            customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+            data: { version: 1, active: ["agent_browser", "gone"] },
+          },
+          {
+            type: "custom",
+            customType: ACTIVE_TOOL_SNAPSHOT_ENTRY,
+            data: { version: 2, active: ["read"] },
+          },
+        ],
+      },
+    } as any;
+    assert.deepEqual(restoreActiveToolSnapshot(pi, ctx), ["agent_browser"]);
+  });
+
+  it("ignores a complete legacy search receipt", () => {
+    const pi = { getAllTools: tools } as any;
+    const ctx = {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolName: "query_tools",
+              details: {
+                query: "browser",
+                backend: "fuse.js",
+                rankings: [{ name: "agent_browser", score: 0.1 }],
+                activated: ["agent_browser"],
+                activeCounts: { before: 1, after: 2 },
+                catalogHash: "hash",
+              },
+            },
+          },
+        ],
+      },
+    } as any;
+    assert.equal(restoreActiveToolSnapshot(pi, ctx), undefined);
   });
 });
 
-// ── restoreFromBranch ────────────────────────────────────────────
+// ── isDiscoveryReceipt ────────────────────────────────────────────
 
-describe("restoreFromBranch", () => {
-  it("restores tools from query_tools receipts", () => {
-    const mockPi = {
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-        { name: "grep", description: "Search files" },
-      ],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "query_tools",
-              details: {
-                query: "browser",
-                backend: "fuse.js",
-                rankings: [{ name: "agent_browser", score: 0.12 }],
-                activated: ["agent_browser"],
-                activeCounts: { before: 5, after: 6 },
-                catalogHash: "abc",
-              },
-            },
-          },
-        ],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, ["agent_browser"]);
+describe("isDiscoveryReceipt", () => {
+  it("accepts rankings with active markers", () => {
+    assert.equal(
+      isDiscoveryReceipt({
+        query: "browser",
+        backend: "fuse.js",
+        rankings: [{ name: "agent_browser", score: 0.1, active: false }],
+        activeCounts: { before: 1, after: 1 },
+        catalogHash: "hash",
+      }),
+      true,
+    );
   });
 
-  it("stops at reset marker (does not restore tools from before reset)", () => {
-    const mockPi = {
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-        { name: "web_search", description: "Search web" },
-      ],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [
-          // index 0 — agent_browser activated (oldest)
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "query_tools",
-              details: {
-                query: "browser",
-                backend: "fuse.js",
-                rankings: [{ name: "agent_browser", score: 0.12 }],
-                activated: ["agent_browser"],
-                activeCounts: { before: 5, after: 6 },
-                catalogHash: "abc",
-              },
-            },
-          },
-          // index 1 — reset marker
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "query_tools",
-              details: {
-                query: "/toolbelt reset",
-                backend: "fuse.js",
-                rankings: [],
-                activated: [],
-                activeCounts: { before: 6, after: 5 },
-                catalogHash: "",
-              },
-            },
-          },
-          // index 2 — web_search activated after reset (newest)
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "query_tools",
-              details: {
-                query: "web search",
-                backend: "fuse.js",
-                rankings: [{ name: "web_search", score: 0.1 }],
-                activated: ["web_search"],
-                activeCounts: { before: 5, after: 6 },
-                catalogHash: "def",
-              },
-            },
-          },
-        ],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    // Should only restore web_search (after reset), not agent_browser (before reset)
-    assert.deepEqual(result, ["web_search"]);
+  it("rejects null, primitives, and arrays", () => {
+    assert.equal(isDiscoveryReceipt(null), false);
+    assert.equal(isDiscoveryReceipt("string"), false);
+    assert.equal(isDiscoveryReceipt([]), false);
   });
 
-  it("skips entries with wrong toolName", () => {
-    const mockPi = {
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-      ],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "other_tool", // not query_tools
-              details: {
-                query: "browser",
-                backend: "fuse.js",
-                rankings: [{ name: "agent_browser", score: 0.12 }],
-                activated: ["agent_browser"],
-                activeCounts: { before: 5, after: 6 },
-                catalogHash: "abc",
-              },
-            },
-          },
-        ],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, []);
+  it("rejects legacy mutation receipts without active field", () => {
+    assert.equal(
+      isDiscoveryReceipt({
+        query: "browser",
+        backend: "fuse.js",
+        rankings: [{ name: "agent_browser", score: 0.1 }],
+        activated: ["agent_browser"],
+        activeCounts: { before: 1, after: 2 },
+        catalogHash: "hash",
+      }),
+      false,
+    );
   });
 
-  it("filters out tools that are no longer registered", () => {
-    const mockPi = {
-      // only agent_browser is still registered
-      getAllTools: () => [
-        { name: "agent_browser", description: "Browse" },
-      ],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "query_tools",
-              details: {
-                query: "tools",
-                backend: "fuse.js",
-                rankings: [
-                  { name: "agent_browser", score: 0.12 },
-                  { name: "deprecated_tool", score: 0.3 },
-                ],
-                activated: ["agent_browser", "deprecated_tool"],
-                activeCounts: { before: 5, after: 7 },
-                catalogHash: "abc",
-              },
-            },
-          },
-        ],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, ["agent_browser"]); // deprecated_tool filtered out
+  it("rejects missing query field", () => {
+    assert.equal(
+      isDiscoveryReceipt({
+        backend: "fuse.js",
+        rankings: [{ name: "agent_browser", score: 0.1, active: false }],
+        activeCounts: { before: 1, after: 1 },
+        catalogHash: "hash",
+      }),
+      false,
+    );
   });
 
-  it("returns empty when branch has no query_tools receipts", () => {
-    const mockPi = {
-      getAllTools: () => [],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolName: "some_other_tool",
-              details: {},
-            },
-          },
-        ],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, []);
-  });
-
-  it("handles empty branch", () => {
-    const mockPi = {
-      getAllTools: () => [],
-    } as any;
-
-    const mockCtx = {
-      sessionManager: {
-        getBranch: () => [],
-      },
-    } as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, []);
-  });
-
-  it("handles missing sessionManager gracefully", () => {
-    const mockPi = {
-      getAllTools: () => [],
-    } as any;
-
-    const mockCtx = {} as any;
-
-    const result = restoreFromBranch(mockPi, mockCtx);
-    assert.deepEqual(result, []);
+  it("rejects missing activeCounts.before", () => {
+    assert.equal(
+      isDiscoveryReceipt({
+        query: "browser",
+        backend: "fuse.js",
+        rankings: [{ name: "agent_browser", score: 0.1, active: false }],
+        activeCounts: { after: 1 },
+        catalogHash: "hash",
+      }),
+      false,
+    );
   });
 });

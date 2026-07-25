@@ -1,79 +1,63 @@
 # pi-toolbelt
 
-Progressive tool discovery for [Pi](https://github.com/earendil-works/pi-coding-agent).
+Progressive tool discovery and explicit session tool management for [Pi](https://github.com/earendil-works/pi-coding-agent).
 
-Carry a small baseline. Ask for more when you need it. The model describes what it wants to do, toolbelt finds matching tools and adds them on the fly.
+Toolbelt keeps active-tool membership visible and deliberate. The model discovers candidates without silently enabling them, the user stages changes in a keyboard-driven modal, and resume restores the latest exact selection.
 
-## How it works
-
-Pi comes with a ton of tools. Most sessions only use a handful. Toolbelt lets you start with just the essentials, then the model can pull in whatever else it needs — browse, fetch, analyze — by saying what it's trying to do.
-
-```
-User: "scrape this docs page and summarize the API changes"
-Model: calls query_tools("fetch and extract webpage content")
-       → agent_browser gets activated automatically
-       → proceeds to use it
-```
-
-No "you don't have that tool" errors. No bloated baseline.
-
-## Getting started
-
-### 1. Install
+## Install
 
 ```sh
 npm install pi-toolbelt
 ```
 
-### 2. Configure
+## Configure
 
-Create a config to pick your baseline tools:
-
-```sh
-# Global config (all projects)
-pi toolbelt setup global
-
-# Or per-project
-pi toolbelt setup project
+```text
+/toolbelt setup global
+/toolbelt setup project
 ```
 
-Default baseline: `read`, `bash`, `edit`, `write`.
+The configured `baseline` is the exact set applied on a new session or `/toolbelt reset`, after unregistered names are removed. Toolbelt does not force `query_tools` or `manage_tools` into that set.
 
-### 3. Use it
+## Manage session tools
 
-The model will discover tools on its own when you describe tasks. You can also check what's active:
+Run `/toolbelt tools`. The modal lists every registered tool as `[x]` active or `[ ]` inactive with its name and description. Type to filter, use Up/Down to move, Space to stage, Enter to persist/apply once, and Escape to cancel. Without valid config, the modal remains available read-only and points to setup.
 
-```sh
-pi toolbelt status
+Use `/toolbelt status` to inspect exact active names. Use `/toolbelt reset` to restore the registered configured baseline.
+
+## Model workflow
+
+`query_tools` returns ranked `{ name, score, active }` results and never changes active tools. `manage_tools` performs one direction per call:
+
+```json
+{ "action": "activate", "tools": ["agent_browser"] }
 ```
 
-Reset search-added tools without losing your baseline:
-
-```sh
-pi toolbelt reset
+```json
+{ "action": "deactivate", "tools": ["query_tools", "manage_tools"] }
 ```
 
-## How the model sees it
+Both are ordinary registered tools and may be enabled or disabled. Toolbelt validates exact names and never executes target tools.
 
-The model has a tool called `query_tools`. It takes a query describing a capability — "fetch a URL", "search the web", "generate an image" — and toolbelt fuzzy-matches against Pi's full tool catalog. Matches get added to the active set immediately.
+## Session restoration
 
-The model just describes what it needs and gets on with it. No prompts, no hunting through tool lists.
+Each confirmed model, modal, setup, or reset mutation persists the complete final active-name set before applying it. Resume uses the newest valid snapshot and filters unregistered names. An older session without a snapshot starts from configured baseline instead of replaying legacy activations.
 
 ## Config
 
-Config lives in `~/.pi/agent/toolbelt.json` (global) or `.pi/toolbelt.json` (per-project). Project config overrides global.
+Global: `~/.pi/agent/toolbelt.json`. Project: `.pi/toolbelt.json` (fields override global; arrays replace).
 
 ```json
-{
-  "baseline": ["read", "bash", "edit", "write"],
-  "threshold": 0.4,
-  "topK": 5
-}
+{ "baseline": ["read", "bash", "edit", "write"], "threshold": 0.4, "topK": 5 }
 ```
 
-- `baseline` — tools always active
-- `threshold` — match strictness (0 = exact, 1 = anything)
-- `topK` — max tools to activate per query
+- `baseline`: exact new-session/reset active names
+- `threshold`: Fuse strictness from 0 (exact) to 1 (anything)
+- `topK`: maximum discovery results
+
+## Roadmap
+
+A visual global/project config editor is intentionally deferred. This release manages session state only.
 
 ## License
 

@@ -6,8 +6,17 @@ export const FLAG_DEBUG = "toolbelt-debug";
 /** Config file name placed in ~/.pi/agent/ and .pi/. */
 export const CONFIG_FILE_NAME = "toolbelt.json";
 
-/** The loader tool that must always remain active when Toolbelt is enabled. */
+/** Discovery tool name; active membership is controlled by config/session state. */
 export const LOADER_TOOL_NAME = "query_tools";
+
+/** Explicit model-facing active-set management tool. */
+export const MANAGE_TOOL_NAME = "manage_tools";
+
+/** Custom session entry key for complete active-set snapshots. */
+export const ACTIVE_TOOL_SNAPSHOT_ENTRY = "toolbelt-active-set";
+
+/** Current persisted active-set snapshot schema version. */
+export const ACTIVE_TOOL_SNAPSHOT_VERSION = 1;
 
 /** Command name for the /toolbelt slash command. Used by index.ts registration. */
 export const COMMAND_NAME = "toolbelt";
@@ -31,7 +40,7 @@ export const FUSE_OPTIONS = {
 
 /** Default config seeded by /toolbelt setup. */
 export const DEFAULT_CONFIG = {
-  baseline: ["read", "bash", "edit", "write"],
+  baseline: ["read", "bash", "edit", "write", "query_tools", "manage_tools"],
   threshold: 0.4,
   topK: 5,
 };

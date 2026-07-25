@@ -1,116 +1,136 @@
-/**
- * Session lifecycle handler — baseline activation and resume restoration.
- *
- * Follows extensions.md:1827-1835 (state reconstruction via tool result details)
- * and pi-powerline-footer/index.ts:2070-2100 (branch scanning pattern).
- *
- * Tool results in the session branch use role "toolResult" (not "tool"),
- * with the `toolName` field on the message identifying the tool. We scan
- * for entries where `toolName === "query_tools"` and read their `details`.
- */
+/** Active-set persistence and session restoration. */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LOADER_TOOL_NAME } from "./constants.js";
-import type { EffectiveConfig, SearchReceipt } from "./types.js";
+import {
+  ACTIVE_TOOL_SNAPSHOT_ENTRY,
+  ACTIVE_TOOL_SNAPSHOT_VERSION,
+} from "./constants.js";
+import type {
+  ActiveToolChange,
+  ActiveToolSnapshot,
+  DiscoveryReceipt,
+} from "./types.js";
 
-// ── Branch entry shape (what Pi actually persists) ───────────────
+// ── Registered-tool filtering ────────────────────────────────────
 
-interface BranchEntry {
-  type: string;
-  message?: {
-    role: string;
-    toolName?: string;
-    details?: unknown;
+/**
+ * Keep requested order, remove duplicates, and enforce Pi's registration
+ * boundary. Names absent from getAllTools() are silently removed.
+ */
+export function filterRegisteredTools(
+  pi: Pick<ExtensionAPI, "getAllTools">,
+  names: readonly string[],
+): string[] {
+  const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+  return [...new Set(names)].filter((name) => registered.has(name));
+}
+
+// ── Persistence-first mutation ──────────────────────────────────
+
+/**
+ * Persist the complete final set before replacing Pi's active tools.
+ * appendEntry is synchronous; a thrown write aborts before setActiveTools.
+ */
+export function persistActiveTools(
+  pi: ExtensionAPI,
+  requested: readonly string[],
+): ActiveToolChange {
+  const before = pi.getActiveTools();
+  const after = filterRegisteredTools(pi, requested);
+  const snapshot: ActiveToolSnapshot = {
+    version: ACTIVE_TOOL_SNAPSHOT_VERSION,
+    active: after,
+  };
+
+  pi.appendEntry(ACTIVE_TOOL_SNAPSHOT_ENTRY, snapshot);
+  pi.setActiveTools(after);
+
+  const beforeSet = new Set(before);
+  const afterSet = new Set(after);
+  return {
+    before,
+    after,
+    added: after.filter((name) => !beforeSet.has(name)),
+    removed: before.filter((name) => !afterSet.has(name)),
   };
 }
 
-// ── Baseline activation ──────────────────────────────────────────
+// ── Snapshot restoration ─────────────────────────────────────────
 
 /**
- * Apply the baseline active tool set.
- * Used by new-session start and /toolbelt reset.
+ * Return the newest valid snapshot from the session branch, filtering
+ * unregistered names. Returns undefined when no valid snapshot exists.
  */
-export function applyBaseline(
-  pi: ExtensionAPI,
-  effective: EffectiveConfig,
-): string[] {
-  const active = [...new Set([...effective.baseline, LOADER_TOOL_NAME])];
-  pi.setActiveTools(active);
-  return active;
-}
-
-// ── Resume restoration ───────────────────────────────────────────
-
-/**
- * Scan the current session branch backwards for query_tools receipts.
- * Stops at the most recent reset marker (activated: [], query === "/toolbelt reset").
- * Returns tool names to restore, filtered to currently registered tools only.
- *
- * Per extensions.md:2310: "Names passed to pi.setActiveTools() must already
- * be registered; unknown names are ignored." We filter here to avoid passing
- * names for tools that were unregistered since the receipt was created.
- */
-export function restoreFromBranch(
+export function restoreActiveToolSnapshot(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-): string[] {
-  const branch: BranchEntry[] =
-    (ctx.sessionManager?.getBranch?.() as BranchEntry[]) ?? [];
-  const restored = new Set<string>();
+): string[] | undefined {
+  const branch = ctx.sessionManager.getBranch();
 
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
-
-    // Pi persists tool results with message.role === "toolResult"
-    // and message.toolName identifying the tool.
     if (
-      entry.type !== "message" ||
-      !entry.message ||
-      entry.message.role !== "toolResult" ||
-      entry.message.toolName !== LOADER_TOOL_NAME
+      entry.type !== "custom" ||
+      entry.customType !== ACTIVE_TOOL_SNAPSHOT_ENTRY ||
+      !isActiveToolSnapshot(entry.data)
     ) {
       continue;
     }
-
-    const details = entry.message.details as SearchReceipt | undefined;
-    if (!isSearchReceipt(details)) continue;
-
-    // Reset marker: stop scanning at this boundary
-    if (
-      details.activated.length === 0 &&
-      details.query === "/toolbelt reset"
-    ) {
-      break;
-    }
-
-    // Accumulate activated tools from this receipt
-    for (const name of details.activated) {
-      restored.add(name);
-    }
+    return filterRegisteredTools(pi, entry.data.active);
   }
 
-  // Filter to currently registered tools only
-  const registered = new Set(pi.getAllTools().map((t) => t.name));
-  return [...restored].filter((name) => registered.has(name));
+  return undefined;
 }
 
-// ── Receipt validation ───────────────────────────────────────────
+// ── Type guards ──────────────────────────────────────────────────
 
-/** Validate that an unknown value is a SearchReceipt. */
-export function isSearchReceipt(
-  details: unknown,
-): details is SearchReceipt {
-  if (typeof details !== "object" || details === null) return false;
-  const d = details as Record<string, unknown>;
+/** Validate a versioned full active-set snapshot. */
+export function isActiveToolSnapshot(
+  value: unknown,
+): value is ActiveToolSnapshot {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const snapshot = value as Record<string, unknown>;
   return (
-    typeof d.query === "string" &&
-    typeof d.backend === "string" &&
-    Array.isArray(d.rankings) &&
-    Array.isArray(d.activated) &&
-    typeof d.activeCounts === "object" &&
-    d.activeCounts !== null &&
-    typeof (d.activeCounts as Record<string, unknown>).before === "number" &&
-    typeof (d.activeCounts as Record<string, unknown>).after === "number" &&
-    typeof d.catalogHash === "string"
+    snapshot.version === ACTIVE_TOOL_SNAPSHOT_VERSION &&
+    Array.isArray(snapshot.active) &&
+    snapshot.active.every((name) => typeof name === "string")
+  );
+}
+
+/** Validate a discovery-only query_tools receipt. */
+export function isDiscoveryReceipt(
+  value: unknown,
+): value is DiscoveryReceipt {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const receipt = value as Record<string, unknown>;
+  if (
+    typeof receipt.query !== "string" ||
+    typeof receipt.backend !== "string" ||
+    !Array.isArray(receipt.rankings) ||
+    typeof receipt.activeCounts !== "object" ||
+    receipt.activeCounts === null ||
+    typeof receipt.catalogHash !== "string"
+  ) {
+    return false;
+  }
+  const counts = receipt.activeCounts as Record<string, unknown>;
+  return (
+    typeof counts.before === "number" &&
+    typeof counts.after === "number" &&
+    (receipt.rankings as Array<unknown>).every((value) => {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return false;
+      }
+      const ranking = value as Record<string, unknown>;
+      return (
+        typeof ranking.name === "string" &&
+        typeof ranking.score === "number" &&
+        typeof ranking.active === "boolean"
+      );
+    })
   );
 }
