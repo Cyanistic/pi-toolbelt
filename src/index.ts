@@ -7,7 +7,11 @@
  * the registered configured baseline or the newest exact active-set snapshot.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 /** Matching pi-tui AutocompleteItem for tab completions. */
 interface AutocompleteItem {
@@ -29,12 +33,18 @@ function autocompleteItem(
 import { handleToolbeltCommand } from "./commands.js";
 import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
 import {
-  BACKEND_ID,
+  BACKEND_ID_BM25,
+  BACKEND_ID_LLM,
   COMMAND_NAME,
+  DEFAULT_LIMIT,
+  DEFAULT_LLM_TIMEOUT_MS,
   FLAG_DEBUG,
   LOADER_TOOL_NAME,
   MANAGE_TOOL_NAME,
 } from "./constants.js";
+import type { LlmSearchError, LlmSearchResult } from "./llm-search.js";
+import { llmRank } from "./llm-search.js";
+import type { ToolDiscoveryResult } from "./schemas.js";
 import { ManageToolsParamsSchema, QueryToolsParamsSchema } from "./schemas.js";
 import { buildToolIndex, SearchEngine } from "./search.js";
 import {
@@ -42,12 +52,6 @@ import {
   persistActiveTools,
   restoreActiveToolSnapshot,
 } from "./session.js";
-import type {
-  DiscoveryReceipt,
-  ToolDiscoveryResult,
-  ToolManagementReceipt,
-  ToolRanking,
-} from "./types.js";
 
 /** Completion tree: each node maps a token to the next level. */
 interface CompletionNode {
@@ -146,40 +150,91 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  function annotateActiveState(
-    rankings: ToolRanking[],
-    activeNames: readonly string[],
-  ): ToolDiscoveryResult[] {
-    const active = new Set(activeNames);
-    return rankings.map((ranking) => ({
-      ...ranking,
-      active: active.has(ranking.name),
-    }));
+  // ── Helpers ────────────────────────────────────────────────────
+
+  /**
+   * Get the eligible tool catalog for indexing.
+   * When includeActive is false (default), exclude currently active tools.
+   */
+  function getEligibleTools(
+    includeActive: boolean,
+  ): Array<{ name: string; description?: string }> {
+    const allTools = pi.getAllTools();
+    if (includeActive) return allTools;
+
+    const activeNames = new Set(pi.getActiveTools());
+    return allTools.filter((t) => !activeNames.has(t.name));
   }
 
-  function formatDiscoveryResults(rankings: ToolDiscoveryResult[]): string {
-    return rankings
-      .map(
-        ({ name, score, active }) =>
-          `${name} (${active ? "active" : "inactive"}, ${score.toFixed(3)})`,
-      )
-      .join(", ");
+  /**
+   * Ensure the search index is initialized with the current tool catalog.
+   * Returns the catalog hash for receipt use.
+   */
+  function ensureSearchIndex(includeActive: boolean): string {
+    const eligible = getEligibleTools(includeActive);
+    const activeNames = pi.getActiveTools();
+    const indexed = buildToolIndex(eligible, activeNames);
+
+    if (!searchEngine) {
+      searchEngine = new SearchEngine(indexed);
+    } else {
+      searchEngine.refresh(indexed);
+    }
+    return searchEngine.getCatalogHash();
+  }
+
+  /**
+   * Perform a BM25 search and return ranked results + receipt details.
+   */
+  function bm25Search(
+    query: string,
+    includeActive: boolean,
+    limit: number,
+  ): {
+    rankings: import("./schemas.js").ToolDiscoveryResult[];
+    catalogHash: string;
+  } {
+    const catalogHash = ensureSearchIndex(includeActive);
+    const engine = searchEngine;
+    const rankings = engine ? engine.search(query, limit) : [];
+    return { rankings, catalogHash };
   }
 
   // ── query_tools tool (discovery-only) ─────────────────────────
   pi.registerTool({
     name: LOADER_TOOL_NAME,
     label: "Query Tools",
+    promptSnippet:
+      `Use ${LOADER_TOOL_NAME} when the original task needs a fitting registered tool that is not currently active. ` +
+      "Describe the concrete capability needed. Results include active state. Do NOT mutate the active set - call " +
+      `${MANAGE_TOOL_NAME} with the exact selected name to activate it, then resume the original task.`,
+    promptGuidelines: [
+      `If the user's request requires a capability that is absent from the active tool set, call ${LOADER_TOOL_NAME} to find a registered tool for the needed capability.`,
+      `When ${LOADER_TOOL_NAME} returns a matching inactive tool, call ${MANAGE_TOOL_NAME} with action "activate" and the exact tool name. Then call the newly activated tool to serve the original request.`,
+      `Do not guess tool names - always use exact names returned by ${LOADER_TOOL_NAME}.`,
+    ],
     description:
       "Discover registered tools by capability without changing the active set. " +
-      `Results include current active state. Use ${MANAGE_TOOL_NAME} to activate or deactivate exact names.\n\n` +
-      "HOW TO USE: describe a concrete capability or task. Do not ask to list every tool; " +
-      "search by capability and broaden the query if no result clears the configured threshold.",
+      `Results include current active state. Use ${MANAGE_TOOL_NAME} to activate or deactivate exact names.` +
+      "\n\n" +
+      "HOW TO USE: describe a concrete capability or task. " +
+      "Do not ask to list every tool; search by capability.",
     parameters: QueryToolsParamsSchema,
-    async execute(_toolCallId, params) {
+    async execute(
+      _toolCallId: string,
+      params: import("./schemas.js").QueryToolsParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      _ctx: ExtensionContext,
+    ): Promise<AgentToolResult<Record<string, unknown>>> {
       const query = params.query;
+      const includeActive = params.includeActive ?? false;
+      const limit = params.limit ?? DEFAULT_LIMIT;
+      const timeoutMs = params.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
+
       const active = pi.getActiveTools();
 
+      // ── Not configured ──────────────────────────────────────────
       if (!currentEffectiveConfig) {
         return {
           content: [
@@ -191,67 +246,255 @@ export default function (pi: ExtensionAPI) {
             },
           ],
           details: {
-            query,
-            backend: BACKEND_ID,
-            rankings: [],
+            kind: "ranked",
+            requestedBackend: BACKEND_ID_BM25,
+            actualBackend: BACKEND_ID_BM25,
+            rankings: [] as Array<ToolDiscoveryResult>,
             activeCounts: { before: active.length, after: active.length },
             catalogHash: "",
-          } satisfies DiscoveryReceipt,
+          },
         };
       }
 
-      const { threshold, topK } = currentEffectiveConfig;
-      const indexed = buildToolIndex(pi.getAllTools());
-      if (!searchEngine) {
-        searchEngine = new SearchEngine(indexed);
-      } else {
-        searchEngine.refresh(indexed);
-      }
+      // ── Determine search backend ─────────────────────────────────
+      const isLLM = currentEffectiveConfig.search.type === "llm";
+      const isProjectSearch = currentEffectiveConfig.searchSource === "project";
+      const projectTrusted = _ctx?.isProjectTrusted?.() ?? false;
 
-      const ranked = searchEngine.search(query, threshold, topK);
-      if (ranked.length === 0) {
-        const nearMisses = annotateActiveState(
-          searchEngine.search(query, 1.0, topK),
-          active,
+      // Collect eligible catalog for LLM mode
+      const allTools = pi.getAllTools();
+      const activeNamesSet = new Set(active);
+      const eligible = includeActive
+        ? allTools
+        : allTools.filter((t) => !activeNamesSet.has(t.name));
+
+      if (!isLLM) {
+        // ── BM25 mode ──────────────────────────────────────────────
+        const { rankings, catalogHash } = bm25Search(
+          query,
+          includeActive,
+          limit,
         );
+
+        if (rankings.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No tools matched "${query}". Try a different query.`,
+              },
+            ],
+            details: {
+              kind: "ranked" as const,
+              requestedBackend: BACKEND_ID_BM25,
+              actualBackend: BACKEND_ID_BM25,
+              rankings: [] as Array<ToolDiscoveryResult>,
+              activeCounts: {
+                before: active.length,
+                after: active.length,
+              },
+              catalogHash,
+            },
+          };
+        }
+
+        const resultText = rankings
+          .map(
+            ({ rank, name, description, active: isActive }) =>
+              `${rank}. ${name}${isActive ? "" : " (inactive)"}${description ? ` - ${description}` : ""}`,
+          )
+          .join("\n");
+
         return {
           content: [
             {
               type: "text",
               text:
-                `No tools matched "${query}" above threshold ${threshold}. ` +
-                (nearMisses.length > 0
-                  ? `Near misses: ${formatDiscoveryResults(nearMisses)}`
-                  : "No ranking results found."),
+                `Matching registered tools:\n${resultText}\n\n` +
+                `Use ${MANAGE_TOOL_NAME} with an exact tool name to change membership.`,
             },
           ],
           details: {
-            query,
-            backend: BACKEND_ID,
-            rankings: nearMisses,
-            activeCounts: { before: active.length, after: active.length },
-            catalogHash: searchEngine.getCatalogHash(),
-          } satisfies DiscoveryReceipt,
+            kind: "ranked" as const,
+            requestedBackend: BACKEND_ID_BM25,
+            actualBackend: BACKEND_ID_BM25,
+            rankings,
+            activeCounts: {
+              before: active.length,
+              after: active.length,
+            },
+            catalogHash,
+          },
         };
       }
 
-      const rankings = annotateActiveState(ranked, active);
+      // ── LLM mode ─────────────────────────────────────────────────
+      const requestedBackend = BACKEND_ID_LLM;
+      const configuredModel =
+        currentEffectiveConfig.search.type === "llm"
+          ? currentEffectiveConfig.search.model
+          : undefined;
+
+      // Check project trust for project-selected LLM
+      if (isProjectSearch && !projectTrusted) {
+        // Fall back to BM25: untrusted project
+        const { rankings, catalogHash } = bm25Search(
+          query,
+          includeActive,
+          limit,
+        );
+
+        const fallbackReason =
+          "project-selected LLM rejected: project is not trusted";
+
+        const resultText =
+          rankings.length > 0
+            ? rankings
+                .map(
+                  ({ rank, name, description, active: isActive }) =>
+                    `${rank}. ${name}${isActive ? "" : " (inactive)"}${description ? ` - ${description}` : ""}`,
+                )
+                .join("\n")
+            : `No tools matched "${query}".`;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `[LLM unavailable - ${fallbackReason}]\n\n` +
+                `BM25 fallback results:\n${resultText}`,
+            },
+          ],
+          details: {
+            kind: "ranked" as const,
+            requestedBackend,
+            actualBackend: BACKEND_ID_BM25,
+            fallbackReason,
+            rankings,
+            activeCounts: {
+              before: active.length,
+              after: active.length,
+            },
+            catalogHash,
+          },
+        };
+      }
+
+      // Attempt LLM ranking
+      const catalogWithActive = eligible.map((t) => ({
+        name: t.name,
+        description: t.description ?? "",
+        active: activeNamesSet.has(t.name),
+      }));
+
+      const llmResult = await llmRank(
+        query,
+        limit,
+        catalogWithActive,
+        _ctx,
+        _signal,
+        timeoutMs,
+        configuredModel,
+      );
+
+      const llmError =
+        "code" in (llmResult as LlmSearchError)
+          ? (llmResult as LlmSearchError)
+          : null;
+
+      if (llmError) {
+        if (llmError.code === "cancelled") {
+          // Parent cancellation — stop without fallback
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Discovery cancelled.",
+              },
+            ],
+            details: {
+              kind: "ranked" as const,
+              requestedBackend,
+              actualBackend: BACKEND_ID_LLM,
+              rankings: [] as Array<ToolDiscoveryResult>,
+              activeCounts: {
+                before: active.length,
+                after: active.length,
+              },
+              catalogHash: "",
+            },
+          };
+        }
+
+        // Recoverable failure — fall back to BM25
+        const { rankings, catalogHash } = bm25Search(
+          query,
+          includeActive,
+          limit,
+        );
+
+        const resultText =
+          rankings.length > 0
+            ? rankings
+                .map(
+                  ({ rank, name, description, active: isActive }) =>
+                    `${rank}. ${name}${isActive ? "" : " (inactive)"}${description ? ` - ${description}` : ""}`,
+                )
+                .join("\n")
+            : `No tools matched "${query}".`;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `[LLM unavailable - ${llmError.message}]\n\n` +
+                `BM25 fallback results:\n${resultText}`,
+            },
+          ],
+          details: {
+            kind: "ranked" as const,
+            requestedBackend,
+            actualBackend: BACKEND_ID_BM25,
+            fallbackReason: llmError.message,
+            rankings,
+            activeCounts: {
+              before: active.length,
+              after: active.length,
+            },
+            catalogHash,
+          },
+        };
+      }
+
+      const llmSuccess = llmResult as LlmSearchResult;
+
+      // Successful LLM ranking
       return {
         content: [
           {
             type: "text",
             text:
-              `Matching registered tools: ${formatDiscoveryResults(rankings)}. ` +
+              `LLM advisory results for "${query}":\n${llmSuccess.raw}\n\n` +
               `Use ${MANAGE_TOOL_NAME} with an exact tool name to change membership.`,
           },
         ],
         details: {
-          query,
-          backend: BACKEND_ID,
-          rankings,
-          activeCounts: { before: active.length, after: active.length },
-          catalogHash: searchEngine.getCatalogHash(),
-        } satisfies DiscoveryReceipt,
+          kind: "advisory" as const,
+          requestedBackend,
+          actualBackend: BACKEND_ID_LLM,
+          model: llmSuccess.model,
+          raw: llmSuccess.raw,
+          ...(llmSuccess.usage !== undefined
+            ? { usage: llmSuccess.usage }
+            : {}),
+          activeCounts: {
+            before: active.length,
+            after: active.length,
+          },
+          catalogHash: ensureSearchIndex(includeActive),
+        },
       };
     },
   });
@@ -260,12 +503,23 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: MANAGE_TOOL_NAME,
     label: "Manage Tools",
+    promptSnippet:
+      `Use ${MANAGE_TOOL_NAME} to activate or deactivate registered Pi tools by exact name after discovering them with ` +
+      `${LOADER_TOOL_NAME}. Specify one or more exact registered tool names and the direction (activate or deactivate).`,
+    promptGuidelines: [
+      `When ${LOADER_TOOL_NAME} returns a matching inactive tool, call ${MANAGE_TOOL_NAME} with action "activate" and the exact tool name from the results.`,
+      `After activating a tool through ${MANAGE_TOOL_NAME}, call that newly available tool to carry out the original request.`,
+      `Use only exact tool names as shown in the registered catalog - ${MANAGE_TOOL_NAME} rejects unknown names.`,
+    ],
     description:
       "Activate or deactivate registered Pi tools by exact name. Performs one direction per call, " +
       "persists the complete final active set before applying it, and never executes the target tools. " +
       "Any registered tool, including query_tools and manage_tools, may be deactivated.",
     parameters: ManageToolsParamsSchema,
-    async execute(_toolCallId, params) {
+    async execute(
+      _toolCallId: string,
+      params: import("./schemas.js").ManageToolsParams,
+    ) {
       if (!currentEffectiveConfig) {
         throw new Error(
           "Toolbelt is not configured. Run /toolbelt setup before changing active tools.",
@@ -315,7 +569,7 @@ export default function (pi: ExtensionAPI) {
           action,
           requested,
           ...change,
-        } satisfies ToolManagementReceipt,
+        },
       };
     },
   });

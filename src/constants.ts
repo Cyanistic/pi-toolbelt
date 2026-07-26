@@ -21,26 +21,20 @@ export const ACTIVE_TOOL_SNAPSHOT_VERSION = 1;
 /** Command name for the /toolbelt slash command. Used by index.ts registration. */
 export const COMMAND_NAME = "toolbelt";
 
-/** Backend identifier embedded in search receipts. */
-export const BACKEND_ID = "fuse.js";
+/** Local BM25 backend identifier embedded in search receipts. */
+export const BACKEND_ID_BM25 = "bm25";
 
-/** Minimum number of characters for a search query token match. */
-export const MIN_MATCH_CHAR_LENGTH = 2;
-
-/** fuse.js search keys: which tool fields to index. */
-export const SEARCH_KEYS = ["name", "description"];
-
-/** fuse.js options beyond threshold (set at search time from config). */
-export const FUSE_OPTIONS = {
-  includeScore: true,
-  shouldSort: true,
-  minMatchCharLength: MIN_MATCH_CHAR_LENGTH,
-  keys: SEARCH_KEYS,
-} as const;
+/** Advisory LLM backend identifier embedded in search receipts. */
+export const BACKEND_ID_LLM = "llm";
 
 /** Default config seeded by /toolbelt setup. */
 export const DEFAULT_CONFIG = {
   baseline: ["read", "bash", "edit", "write", "query_tools", "manage_tools"],
-  threshold: 0.4,
-  topK: 5,
+  // search defaults are applied at merge time: { type: "bm25" }
 };
+
+/** Default limit for query_tools results when caller omits limit. */
+export const DEFAULT_LIMIT = 5;
+
+/** Default timeout (ms) for LLM-ranking calls when caller omits timeoutMs. */
+export const DEFAULT_LLM_TIMEOUT_MS = 30000;

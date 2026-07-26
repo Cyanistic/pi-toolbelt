@@ -18,9 +18,8 @@ See:
 | Command | What it does |
 |---|---|
 | `npm run typecheck` | Type-check all source |
-| `npm test` | Run all tests (node:test + tsx) |
-| `npm run benchmark` | Search performance benchmarks |
+| `npm run check` | Biome lint + typecheck (CI entry point) |
 
-## Tests
+## Quality
 
-`node:test` + `node:assert/strict`. No external test runner.
+`npm run check` runs Biome checks and TypeScript type-checking. No automated test suite is introduced; verification uses strict TypeScript, Biome, and repeatable real Pi workflows.

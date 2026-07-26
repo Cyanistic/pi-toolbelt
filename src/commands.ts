@@ -1,7 +1,7 @@
 /**
  * /toolbelt command dispatcher.
  *
- * Follows setup-command.ts:57-140 pattern: guard → confirm → write → apply → report.
+ * Follows setup-command.ts:57-140 pattern: guard -> confirm -> write -> apply -> report.
  * Each subcommand is a named handler dispatched from the top-level command.
  */
 
@@ -17,19 +17,14 @@ import {
   isEnabled,
   writeToolbeltConfig,
 } from "./config.js";
-import {
-  BACKEND_ID,
-  DEFAULT_CONFIG,
-  FLAG_DEBUG,
-  LOADER_TOOL_NAME,
-} from "./constants.js";
+import { DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
 import {
   filterRegisteredTools,
   isDiscoveryReceipt,
   persistActiveTools,
 } from "./session.js";
 import { openToolManager } from "./tool-manager.js";
-import type { DiscoveryReceipt, ToolbeltConfig } from "./types.js";
+import type { ToolbeltConfig } from "./types.js";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -120,8 +115,7 @@ async function handleSetup(
   // Build config from defaults
   const config: ToolbeltConfig = {
     baseline: [...DEFAULT_CONFIG.baseline],
-    threshold: DEFAULT_CONFIG.threshold,
-    topK: DEFAULT_CONFIG.topK,
+    search: { type: "bm25" },
   };
 
   // Confirm before writing
@@ -172,13 +166,18 @@ async function handleSetup(
 // ── Confirm message builder ───────────────────────────────────────
 
 function buildSetupConfirm(targetPath: string, config: ToolbeltConfig): string {
+  const searchDesc =
+    config.search.type === "llm"
+      ? `LLM (model: ${config.search.model ?? "inherit active"})`
+      : "BM25 (local)";
+
   const lines: string[] = [
     "Toolbelt will apply the following changes:",
     "",
     `Config file: ${targetPath}`,
     `Baseline tools: ${config.baseline.join(", ")}`,
     `Discovery tool: ${LOADER_TOOL_NAME} (active only when included in baseline or enabled for the session)`,
-    `Threshold: ${config.threshold}  |  Top-K: ${config.topK}`,
+    `Search mode: ${searchDesc}`,
     "",
     "The configured baseline will be activated immediately.",
     "Proceed?",
@@ -194,6 +193,11 @@ function buildSetupReport(
   active: string[],
   debug: boolean,
 ): string {
+  const searchDesc =
+    effective.search.type === "llm"
+      ? `LLM (model: ${effective.search.model ?? "inherit active"})`
+      : "BM25 (local)";
+
   const lines: string[] = [
     "✓ Toolbelt setup complete",
     "",
@@ -204,7 +208,7 @@ function buildSetupReport(
   ];
   if (debug) {
     lines.push(
-      `Threshold: ${effective.threshold}  |  Top-K: ${effective.topK}`,
+      `Search mode: ${searchDesc} (source: ${effective.searchSource})`,
     );
   }
   return lines.join("\n");
@@ -268,7 +272,7 @@ async function handleStatus(
   const registered = pi.getAllTools();
 
   // Find last query_tools discovery receipt on branch
-  let lastReceipt: DiscoveryReceipt | undefined;
+  let lastReceipt: unknown | undefined;
   const branch = ctx.sessionManager?.getBranch?.() ?? [];
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
@@ -278,7 +282,7 @@ async function handleStatus(
     if (
       entry.message.role === "toolResult" &&
       entry.message.toolName === LOADER_TOOL_NAME &&
-      isDiscoveryReceipt(entry.message.details)
+      entry.message.details !== undefined
     ) {
       lastReceipt = entry.message.details;
       break;
@@ -291,13 +295,16 @@ async function handleStatus(
     if (effective.globalValid) configPaths.push(effective.globalPath);
     if (effective.projectValid) configPaths.push(effective.projectPath);
 
+    const searchDesc =
+      effective.search.type === "llm"
+        ? `LLM (model: ${effective.search.model ?? "inherit active"})`
+        : "BM25 (local)";
+
     lines.push("Toolbelt: enabled");
     lines.push(`Config: ${configPaths.join(", ")}`);
     lines.push(`Source: ${effective.source}`);
     lines.push(`Baseline: ${effective.baseline.join(", ") || "(none)"}`);
-    lines.push(
-      `Backend: ${BACKEND_ID} | threshold: ${effective.threshold} | topK: ${effective.topK}`,
-    );
+    lines.push(`Search: ${searchDesc} (source: ${effective.searchSource})`);
   } else if (hasConfigError(effective)) {
     lines.push("Toolbelt: disabled (config has errors)");
     const errors: string[] = [];
@@ -313,19 +320,44 @@ async function handleStatus(
   lines.push(`Active: ${active.length} / ${registered.length} registered`);
   lines.push(`Active names: ${active.join(", ") || "(none)"}`);
 
-  if (lastReceipt) {
+  if (lastReceipt !== undefined && isDiscoveryReceipt(lastReceipt)) {
+    const receipt = lastReceipt;
     lines.push("");
-    lines.push(`Last search: "${lastReceipt.query}"`);
     lines.push(
-      lastReceipt.rankings.length > 0
-        ? `  matches: ${lastReceipt.rankings
-            .map(
-              ({ name, score, active }) =>
-                `${name} (${active ? "active" : "inactive"}, ${score.toFixed(3)})`,
-            )
-            .join(", ")}`
-        : "  no ranked tools",
+      `Last search: "${(receipt as { query?: string }).query ?? "unknown"}"`,
     );
+
+    if (receipt.kind === "ranked") {
+      lines.push(
+        receipt.rankings.length > 0
+          ? `  matches (${receipt.requestedBackend}): ${receipt.rankings
+              .map(
+                ({ rank, name, description, active }) =>
+                  `${rank}. ${name} (${active ? "active" : "inactive"})${description ? ` - ${description}` : ""}`,
+              )
+              .join(" | ")}`
+          : "  no matching tools",
+      );
+    } else if (receipt.kind === "advisory") {
+      lines.push(`  backend: ${receipt.actualBackend}`);
+      if (receipt.model) lines.push(`  model: ${receipt.model}`);
+      if (receipt.usage) {
+        const parts: string[] = [];
+        if (receipt.usage.inputTokens !== undefined)
+          parts.push(`in: ${receipt.usage.inputTokens}`);
+        if (receipt.usage.outputTokens !== undefined)
+          parts.push(`out: ${receipt.usage.outputTokens}`);
+        if (receipt.usage.totalTokens !== undefined)
+          parts.push(`total: ${receipt.usage.totalTokens}`);
+        if (parts.length > 0) lines.push(`  usage: ${parts.join(", ")}`);
+      }
+      // Show preview of raw output (first 200 chars)
+      const preview =
+        receipt.raw.length > 200
+          ? `${receipt.raw.slice(0, 200)}...`
+          : receipt.raw;
+      lines.push(`  raw: ${preview}`);
+    }
   }
 
   ctx.ui.notify(lines.join("\n"), "info");

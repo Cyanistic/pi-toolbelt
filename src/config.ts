@@ -7,7 +7,7 @@
  * only path to active-set mutation.
  *
  * Validation accepts partial configs: a project file that sets only
- * `threshold` is valid; missing fields are filled from global defaults
+ * `search` is valid; missing fields are filled from defaults
  * at merge time.
  */
 
@@ -16,8 +16,13 @@ import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
 import { CONFIG_FILE_NAME, DEFAULT_CONFIG } from "./constants.js";
-import { ToolbeltConfigFileSchema } from "./schemas.js";
-import type { ConfigSource, EffectiveConfig, ToolbeltConfig } from "./types.js";
+import { SearchConfigSchema, ToolbeltConfigFileSchema } from "./schemas.js";
+import type {
+  ConfigSource,
+  EffectiveConfig,
+  SearchConfig,
+  ToolbeltConfig,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -85,35 +90,33 @@ export function readToolbeltConfig(path: string): ConfigSource {
 // ---------------------------------------------------------------------------
 
 const toolbeltConfigFileValidator = Compile(ToolbeltConfigFileSchema);
+const searchConfigValidator = Compile(SearchConfigSchema);
 
 /**
  * Map TypeBox validation errors onto the existing user-facing wording.
- * Field order in the schema matches the historical baseline → threshold → topK
- * check order, so the first error preserves that priority.
+ * Field order in the schema matches the expected fields priority.
  */
 function mapToolbeltConfigError(
-  errors: readonly { instancePath: string }[],
+  errors: readonly { instancePath: string; message?: string }[],
 ): string {
   const error = errors[0];
   if (error === undefined) {
-    return `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`;
+    return "toolbelt.json: must contain at least one recognized field (baseline, search)";
   }
 
   const { instancePath } = error;
+
   if (instancePath === "/baseline") {
-    return `toolbelt.json: 'baseline' must be an array of tool names`;
+    return "toolbelt.json: 'baseline' must be an array of tool names";
   }
   if (instancePath.startsWith("/baseline/")) {
-    return `toolbelt.json: 'baseline' entries must be strings`;
+    return "toolbelt.json: 'baseline' entries must be strings";
   }
-  if (instancePath === "/threshold" || instancePath.startsWith("/threshold/")) {
-    return `toolbelt.json: 'threshold' must be a number between 0 and 1`;
-  }
-  if (instancePath === "/topK" || instancePath.startsWith("/topK/")) {
-    return `toolbelt.json: 'topK' must be a positive integer`;
+  if (instancePath === "/search" || instancePath.startsWith("/search/")) {
+    return `toolbelt.json: 'search' must be { "type": "bm25" } or { "type": "llm" } with optional model`;
   }
 
-  return `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`;
+  return "toolbelt.json: must contain at least one recognized field (baseline, search)";
 }
 
 /**
@@ -139,22 +142,24 @@ function validateConfig(
   if (raw.baseline !== undefined) {
     config.baseline = raw.baseline;
   }
-  if (raw.threshold !== undefined) {
-    config.threshold = raw.threshold;
-  }
-  if (raw.topK !== undefined) {
-    config.topK = raw.topK;
+  if (raw.search !== undefined) {
+    if (!searchConfigValidator.Check(raw.search)) {
+      return {
+        path,
+        config: undefined,
+        error:
+          'toolbelt.json: \'search\' must be { "type": "bm25" } or { "type": "llm", "model"?: "provider/id" }',
+      };
+    }
+    config.search = raw.search as SearchConfig;
   }
 
-  if (
-    config.baseline === undefined &&
-    config.threshold === undefined &&
-    config.topK === undefined
-  ) {
+  if (config.baseline === undefined && config.search === undefined) {
     return {
       path,
       config: undefined,
-      error: `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`,
+      error:
+        "toolbelt.json: must contain at least one recognized field (baseline, search)",
     };
   }
 
@@ -162,7 +167,7 @@ function validateConfig(
 }
 
 // ---------------------------------------------------------------------------
-// Merge — project arrays replace, scalars override
+// Merge — project arrays replace, scalars override, search object replaces
 // ---------------------------------------------------------------------------
 
 /**
@@ -171,8 +176,11 @@ function validateConfig(
  * project arrays replace global arrays (not concatenate). Missing fields
  * in either source fall through to the DEFAULT_CONFIG.
  *
+ * The search object is atomic: a project search replaces the global search
+ * as a unit. searchSource records where the effective search came from.
+ *
  * Enabled only when at least one source is valid AND neither source has
- * an error (FRD FR#8: if either config is malformed → disable).
+ * an error (FRD FR#8: if either config is malformed -> disable).
  */
 export function buildEffectiveConfig(cwd: string): EffectiveConfig {
   const globalPath = getGlobalConfigPath();
@@ -188,8 +196,10 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
   // Neither config exists or is valid
   if (!globalValid && !projectValid) {
     return {
-      ...DEFAULT_CONFIG,
+      baseline: [...DEFAULT_CONFIG.baseline],
+      search: { type: "bm25" },
       source: "none",
+      searchSource: "default",
       globalPath,
       projectPath,
       globalValid,
@@ -199,21 +209,29 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
     };
   }
 
-  // Merge: DEFAULT → global → project (each layer fills gaps in the prior)
+  // Merge: DEFAULT -> global -> project (each layer fills gaps in the prior)
   const base = global.config !== undefined ? global.config : {};
+
   const merged: ToolbeltConfig = {
-    baseline:
-      project.config?.baseline ?? base.baseline ?? DEFAULT_CONFIG.baseline,
-    threshold:
-      project.config?.threshold ?? base.threshold ?? DEFAULT_CONFIG.threshold,
-    topK: project.config?.topK ?? base.topK ?? DEFAULT_CONFIG.topK,
+    baseline: project.config?.baseline ??
+      base.baseline ?? [...DEFAULT_CONFIG.baseline],
+    search: project.config?.search ?? base.search ?? { type: "bm25" },
   };
 
   const source = projectValid ? (globalValid ? "both" : "project") : "global";
 
+  // Determine search source
+  let searchSource: EffectiveConfig["searchSource"] = "default";
+  if (project.config?.search !== undefined) {
+    searchSource = "project";
+  } else if (base.search !== undefined) {
+    searchSource = "global";
+  }
+
   return {
     ...merged,
     source,
+    searchSource,
     globalPath,
     projectPath,
     globalValid,
@@ -245,7 +263,7 @@ export function writeToolbeltConfig(
 
 /**
  * True when at least one config source exists and is valid AND
- * neither source has an error (FRD FR#8: malformed config → disable).
+ * neither source has an error (FRD FR#8: malformed config -> disable).
  */
 export function isEnabled(effective: EffectiveConfig): boolean {
   if (

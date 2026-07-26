@@ -3,7 +3,13 @@
 // Schema-derived public types (validated shapes live in schemas.ts).
 export type {
   ActiveToolSnapshot,
+  AdvisoryReceipt,
   DiscoveryReceipt,
+  ManageToolsParams,
+  ModelUsage,
+  QueryToolsParams,
+  RankedReceipt,
+  SearchConfig,
   ToolbeltConfig,
   ToolDiscoveryResult,
   ToolManagementAction,
@@ -14,32 +20,15 @@ import type { ToolbeltConfig, ToolManagementAction } from "./schemas.js";
 /** Resolved configuration combining global + project sources. */
 export interface EffectiveConfig {
   baseline: string[];
-  threshold: number;
-  topK: number;
+  search: import("./schemas.js").SearchConfig;
   source: "global" | "project" | "both" | "none";
+  searchSource: "default" | "global" | "project";
   globalPath: string;
   projectPath: string;
   globalValid: boolean;
   projectValid: boolean;
   globalError?: string;
   projectError?: string;
-}
-
-/** A single tool match from a search query.
- * Score is a fuse.js Bitap score: 0 = perfect match, 1 = no match.
- * Only results where score <= configured threshold are activated. */
-export interface ToolRanking {
-  name: string;
-  score: number;
-}
-
-/** Adapter interface for pluggable search backends.
- * The fuse.js implementation in search.ts is the only v1 backend.
- * Implement this interface to swap backends by replacing one file. */
-export interface SearchBackend {
-  search(query: string, threshold: number, topK: number): ToolRanking[];
-  refresh(tools: Array<{ name: string; description: string }>): boolean;
-  getCatalogHash(): string;
 }
 
 /** Observable result of one persisted active-set replacement. */
