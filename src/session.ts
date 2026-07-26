@@ -1,15 +1,25 @@
 /** Active-set persistence and session restoration. */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Compile } from "typebox/compile";
 import {
   ACTIVE_TOOL_SNAPSHOT_ENTRY,
   ACTIVE_TOOL_SNAPSHOT_VERSION,
 } from "./constants.js";
+import { ActiveToolSnapshotSchema, DiscoveryReceiptSchema } from "./schemas.js";
 import type {
   ActiveToolChange,
   ActiveToolSnapshot,
   DiscoveryReceipt,
 } from "./types.js";
+
+// ── Compiled validators (module scope) ───────────────────────────
+
+const activeToolSnapshotValidator = Compile(ActiveToolSnapshotSchema);
+const discoveryReceiptValidator = Compile(DiscoveryReceiptSchema);
 
 // ── Registered-tool filtering ────────────────────────────────────
 
@@ -69,8 +79,10 @@ export function restoreActiveToolSnapshot(
 
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
+    if (entry === undefined || entry.type !== "custom") {
+      continue;
+    }
     if (
-      entry.type !== "custom" ||
       entry.customType !== ACTIVE_TOOL_SNAPSHOT_ENTRY ||
       !isActiveToolSnapshot(entry.data)
     ) {
@@ -88,49 +100,10 @@ export function restoreActiveToolSnapshot(
 export function isActiveToolSnapshot(
   value: unknown,
 ): value is ActiveToolSnapshot {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const snapshot = value as Record<string, unknown>;
-  return (
-    snapshot.version === ACTIVE_TOOL_SNAPSHOT_VERSION &&
-    Array.isArray(snapshot.active) &&
-    snapshot.active.every((name) => typeof name === "string")
-  );
+  return activeToolSnapshotValidator.Check(value);
 }
 
 /** Validate a discovery-only query_tools receipt. */
-export function isDiscoveryReceipt(
-  value: unknown,
-): value is DiscoveryReceipt {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const receipt = value as Record<string, unknown>;
-  if (
-    typeof receipt.query !== "string" ||
-    typeof receipt.backend !== "string" ||
-    !Array.isArray(receipt.rankings) ||
-    typeof receipt.activeCounts !== "object" ||
-    receipt.activeCounts === null ||
-    typeof receipt.catalogHash !== "string"
-  ) {
-    return false;
-  }
-  const counts = receipt.activeCounts as Record<string, unknown>;
-  return (
-    typeof counts.before === "number" &&
-    typeof counts.after === "number" &&
-    (receipt.rankings as Array<unknown>).every((value) => {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        return false;
-      }
-      const ranking = value as Record<string, unknown>;
-      return (
-        typeof ranking.name === "string" &&
-        typeof ranking.score === "number" &&
-        typeof ranking.active === "boolean"
-      );
-    })
-  );
+export function isDiscoveryReceipt(value: unknown): value is DiscoveryReceipt {
+  return discoveryReceiptValidator.Check(value);
 }

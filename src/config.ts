@@ -11,11 +11,13 @@
  * at merge time.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { getAgentDir, CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import type { ConfigSource, EffectiveConfig, ToolbeltConfig } from "./types.js";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Compile } from "typebox/compile";
 import { CONFIG_FILE_NAME, DEFAULT_CONFIG } from "./constants.js";
+import { ToolbeltConfigFileSchema } from "./schemas.js";
+import type { ConfigSource, EffectiveConfig, ToolbeltConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -82,43 +84,78 @@ export function readToolbeltConfig(path: string): ConfigSource {
 // Validator (lenient — partial configs accepted)
 // ---------------------------------------------------------------------------
 
+const toolbeltConfigFileValidator = Compile(ToolbeltConfigFileSchema);
+
+/**
+ * Map TypeBox validation errors onto the existing user-facing wording.
+ * Field order in the schema matches the historical baseline → threshold → topK
+ * check order, so the first error preserves that priority.
+ */
+function mapToolbeltConfigError(
+  errors: readonly { instancePath: string }[],
+): string {
+  const error = errors[0];
+  if (error === undefined) {
+    return `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`;
+  }
+
+  const { instancePath } = error;
+  if (instancePath === "/baseline") {
+    return `toolbelt.json: 'baseline' must be an array of tool names`;
+  }
+  if (instancePath.startsWith("/baseline/")) {
+    return `toolbelt.json: 'baseline' entries must be strings`;
+  }
+  if (instancePath === "/threshold" || instancePath.startsWith("/threshold/")) {
+    return `toolbelt.json: 'threshold' must be a number between 0 and 1`;
+  }
+  if (instancePath === "/topK" || instancePath.startsWith("/topK/")) {
+    return `toolbelt.json: 'topK' must be a positive integer`;
+  }
+
+  return `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`;
+}
+
 /**
  * Validate present fields against the ToolbeltConfig schema.
  * Missing fields are fine — the merge layer fills from defaults.
  * At least one recognized field must be present.
+ * Unknown fields are tolerated but not copied into the result.
  */
-function validateConfig(raw: Record<string, unknown>, path: string): ConfigSource {
-  const config: Partial<ToolbeltConfig> = {};
-
-  if (raw.baseline !== undefined) {
-    if (!Array.isArray(raw.baseline)) {
-      return { path, config: undefined, error: `toolbelt.json: 'baseline' must be an array of tool names` };
-    }
-    for (const name of raw.baseline) {
-      if (typeof name !== "string") {
-        return { path, config: undefined, error: `toolbelt.json: 'baseline' entries must be strings` };
-      }
-    }
-    config.baseline = raw.baseline as string[];
+function validateConfig(
+  raw: Record<string, unknown>,
+  path: string,
+): ConfigSource {
+  if (!toolbeltConfigFileValidator.Check(raw)) {
+    return {
+      path,
+      config: undefined,
+      error: mapToolbeltConfigError(toolbeltConfigFileValidator.Errors(raw)),
+    };
   }
 
+  // Copy only recognized fields — unknown keys stay out of the validated config.
+  const config: Partial<ToolbeltConfig> = {};
+  if (raw.baseline !== undefined) {
+    config.baseline = raw.baseline;
+  }
   if (raw.threshold !== undefined) {
-    if (typeof raw.threshold !== "number" || raw.threshold < 0 || raw.threshold > 1) {
-      return { path, config: undefined, error: `toolbelt.json: 'threshold' must be a number between 0 and 1` };
-    }
     config.threshold = raw.threshold;
   }
-
   if (raw.topK !== undefined) {
-    if (typeof raw.topK !== "number" || raw.topK < 1 || !Number.isInteger(raw.topK)) {
-      return { path, config: undefined, error: `toolbelt.json: 'topK' must be a positive integer` };
-    }
     config.topK = raw.topK;
   }
 
-  // Must contain at least one recognized field
-  if (config.baseline === undefined && config.threshold === undefined && config.topK === undefined) {
-    return { path, config: undefined, error: `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)` };
+  if (
+    config.baseline === undefined &&
+    config.threshold === undefined &&
+    config.topK === undefined
+  ) {
+    return {
+      path,
+      config: undefined,
+      error: `toolbelt.json: must contain at least one recognized field (baseline, threshold, topK)`,
+    };
   }
 
   return { path, config };
@@ -145,7 +182,8 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
   const project = readToolbeltConfig(projectPath);
 
   const globalValid = global.config !== undefined && global.error === undefined;
-  const projectValid = project.config !== undefined && project.error === undefined;
+  const projectValid =
+    project.config !== undefined && project.error === undefined;
 
   // Neither config exists or is valid
   if (!globalValid && !projectValid) {
@@ -156,8 +194,8 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
       projectPath,
       globalValid,
       projectValid,
-      globalError: global.error,
-      projectError: project.error,
+      ...(global.error !== undefined ? { globalError: global.error } : {}),
+      ...(project.error !== undefined ? { projectError: project.error } : {}),
     };
   }
 
@@ -165,13 +203,9 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
   const base = global.config !== undefined ? global.config : {};
   const merged: ToolbeltConfig = {
     baseline:
-      project.config?.baseline ??
-      base.baseline ??
-      DEFAULT_CONFIG.baseline,
+      project.config?.baseline ?? base.baseline ?? DEFAULT_CONFIG.baseline,
     threshold:
-      project.config?.threshold ??
-      base.threshold ??
-      DEFAULT_CONFIG.threshold,
+      project.config?.threshold ?? base.threshold ?? DEFAULT_CONFIG.threshold,
     topK: project.config?.topK ?? base.topK ?? DEFAULT_CONFIG.topK,
   };
 
@@ -184,8 +218,8 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
     projectPath,
     globalValid,
     projectValid,
-    globalError: global.error,
-    projectError: project.error,
+    ...(global.error !== undefined ? { globalError: global.error } : {}),
+    ...(project.error !== undefined ? { projectError: project.error } : {}),
   };
 }
 
@@ -197,9 +231,12 @@ export function buildEffectiveConfig(cwd: string): EffectiveConfig {
  * Write a toolbelt config file, creating parent directories as needed.
  * Throws on filesystem errors (handled by caller's try/catch).
  */
-export function writeToolbeltConfig(path: string, config: ToolbeltConfig): void {
+export function writeToolbeltConfig(
+  path: string,
+  config: ToolbeltConfig,
+): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +248,11 @@ export function writeToolbeltConfig(path: string, config: ToolbeltConfig): void 
  * neither source has an error (FRD FR#8: malformed config → disable).
  */
 export function isEnabled(effective: EffectiveConfig): boolean {
-  if (effective.globalError !== undefined || effective.projectError !== undefined) return false;
+  if (
+    effective.globalError !== undefined ||
+    effective.projectError !== undefined
+  )
+    return false;
   return effective.source !== "none";
 }
 
@@ -221,5 +262,7 @@ export function isEnabled(effective: EffectiveConfig): boolean {
  * global config should still warn.
  */
 export function hasConfigError(effective: EffectiveConfig): boolean {
-  return effective.globalError !== undefined || effective.projectError !== undefined;
+  return (
+    effective.globalError !== undefined || effective.projectError !== undefined
+  );
 }

@@ -15,19 +15,39 @@ interface AutocompleteItem {
   label: string;
   description?: string;
 }
-import { BACKEND_ID, COMMAND_NAME, FLAG_DEBUG, LOADER_TOOL_NAME, MANAGE_TOOL_NAME } from "./constants.js";
-import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
-import { getGlobalConfigPath, getProjectConfigPath } from "./config.js";
+
+function autocompleteItem(
+  value: string,
+  label: string,
+  description: string | undefined,
+): AutocompleteItem {
+  return description === undefined
+    ? { value, label }
+    : { value, label, description };
+}
+
 import { handleToolbeltCommand } from "./commands.js";
+import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
+import {
+  BACKEND_ID,
+  COMMAND_NAME,
+  FLAG_DEBUG,
+  LOADER_TOOL_NAME,
+  MANAGE_TOOL_NAME,
+} from "./constants.js";
+import { ManageToolsParamsSchema, QueryToolsParamsSchema } from "./schemas.js";
+import { buildToolIndex, SearchEngine } from "./search.js";
+import {
+  filterRegisteredTools,
+  persistActiveTools,
+  restoreActiveToolSnapshot,
+} from "./session.js";
 import type {
   DiscoveryReceipt,
   ToolDiscoveryResult,
-  ToolManagementAction,
   ToolManagementReceipt,
   ToolRanking,
 } from "./types.js";
-import { SearchEngine, buildToolIndex } from "./search.js";
-import { filterRegisteredTools, persistActiveTools, restoreActiveToolSnapshot } from "./session.js";
 
 /** Completion tree: each node maps a token to the next level. */
 interface CompletionNode {
@@ -51,7 +71,8 @@ const COMPS: Record<string, CompletionNode> = {
 
 export default function (pi: ExtensionAPI) {
   let searchEngine: SearchEngine | null = null;
-  let currentEffectiveConfig: ReturnType<typeof buildEffectiveConfig> | null = null;
+  let currentEffectiveConfig: ReturnType<typeof buildEffectiveConfig> | null =
+    null;
 
   pi.registerFlag(FLAG_DEBUG, {
     description: "Show verbose toolbelt debug output",
@@ -61,18 +82,17 @@ export default function (pi: ExtensionAPI) {
 
   // ── /toolbelt command ──────────────────────────────────────────
   pi.registerCommand(COMMAND_NAME, {
-    description: "Toolbelt: setup, inspect, manage, status, and reset session tools",
+    description:
+      "Toolbelt: setup, inspect, manage, status, and reset session tools",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const trimmed = prefix.trimStart();
       const tokens = trimmed.split(/\s+/);
 
       // Empty arg: show all top-level completions
       if (trimmed.length === 0) {
-        return Object.entries(COMPS).map(([value, node]) => ({
-          value,
-          label: value,
-          description: node.description,
-        }));
+        return Object.entries(COMPS).map(([value, node]) =>
+          autocompleteItem(value, value, node.description),
+        );
       }
 
       // Walk the tree: navigate parents of the last (partial) token.
@@ -80,11 +100,13 @@ export default function (pi: ExtensionAPI) {
       // tokens.length - 1 nodes (the last token is either empty from
       // trailing space or is the partial completion).
       const endsWithSpace = /\s$/.test(trimmed);
-      const lastToken = tokens[tokens.length - 1];
+      const lastToken = tokens[tokens.length - 1] ?? "";
 
       let root: Record<string, CompletionNode> = COMPS;
       for (let i = 0; i < tokens.length - 1; i++) {
-        const child = root[tokens[i]];
+        const token = tokens[i];
+        if (token === undefined) return null;
+        const child = root[token];
         if (!child) return null;
         root = child.children ?? {};
       }
@@ -93,11 +115,9 @@ export default function (pi: ExtensionAPI) {
         // User finished a token (trailing space) — show next level
         const entries = Object.entries(root);
         if (entries.length === 0) return null;
-        return entries.map(([value, child]) => ({
-          value: trimmed + value,
-          label: value,
-          description: child.description,
-        }));
+        return entries.map(([value, child]) =>
+          autocompleteItem(trimmed + value, value, child.description),
+        );
       }
 
       // Filter parent's children by the last token prefix
@@ -105,11 +125,13 @@ export default function (pi: ExtensionAPI) {
         value.startsWith(lastToken),
       );
       if (entries.length === 0) return null;
-      return entries.map(([value, child]) => ({
-        value: trimmed.slice(0, trimmed.lastIndexOf(lastToken)) + value,
-        label: value,
-        description: child.description,
-      }));
+      return entries.map(([value, child]) =>
+        autocompleteItem(
+          trimmed.slice(0, trimmed.lastIndexOf(lastToken)) + value,
+          value,
+          child.description,
+        ),
+      );
     },
     handler: async (args, ctx) => {
       await handleToolbeltCommand(args, pi, ctx);
@@ -153,19 +175,9 @@ export default function (pi: ExtensionAPI) {
       `Results include current active state. Use ${MANAGE_TOOL_NAME} to activate or deactivate exact names.\n\n` +
       "HOW TO USE: describe a concrete capability or task. Do not ask to list every tool; " +
       "search by capability and broaden the query if no result clears the configured threshold.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Concrete capability or task to find a registered tool for, such as web search or PDF reading",
-        },
-      },
-      required: ["query"],
-    },
+    parameters: QueryToolsParamsSchema,
     async execute(_toolCallId, params) {
-      const query = String(params.query ?? "");
+      const query = params.query;
       const active = pi.getActiveTools();
 
       if (!currentEffectiveConfig) {
@@ -252,23 +264,7 @@ export default function (pi: ExtensionAPI) {
       "Activate or deactivate registered Pi tools by exact name. Performs one direction per call, " +
       "persists the complete final active set before applying it, and never executes the target tools. " +
       "Any registered tool, including query_tools and manage_tools, may be deactivated.",
-    parameters: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: ["activate", "deactivate"],
-          description: "Whether to activate or deactivate every supplied tool name",
-        },
-        tools: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-          description: "One or more exact registered tool names",
-        },
-      },
-      required: ["action", "tools"],
-    },
+    parameters: ManageToolsParamsSchema,
     async execute(_toolCallId, params) {
       if (!currentEffectiveConfig) {
         throw new Error(
@@ -276,17 +272,8 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const action = String(params.action ?? "") as ToolManagementAction;
-      if (action !== "activate" && action !== "deactivate") {
-        throw new Error(`Invalid tool-management action: ${String(params.action)}`);
-      }
-
-      const requested = Array.isArray(params.tools)
-        ? [...new Set(params.tools.filter((name): name is string => typeof name === "string"))]
-        : [];
-      if (requested.length === 0) {
-        throw new Error("At least one exact registered tool name is required.");
-      }
+      const { action } = params;
+      const requested = [...new Set(params.tools)];
 
       const registered = new Set(pi.getAllTools().map((tool) => tool.name));
       const unknown = requested.filter((name) => !registered.has(name));
@@ -301,7 +288,7 @@ export default function (pi: ExtensionAPI) {
           ? [...new Set([...before, ...requested])]
           : before.filter((name) => !requestedSet.has(name));
 
-      let change;
+      let change: ReturnType<typeof persistActiveTools>;
       try {
         change = persistActiveTools(pi, target);
       } catch (error) {

@@ -13,11 +13,12 @@ import type {
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import {
+  type Component,
   decodeKittyPrintable,
   Key,
   matchesKey,
+  type TUI,
   truncateToWidth,
-  type Component,
 } from "@earendil-works/pi-tui";
 import { Panel } from "./panel.js";
 
@@ -124,6 +125,7 @@ export function reduceToolManagerState(
   if (state.readOnly || visible.length === 0) return { state };
 
   const selected = visible[state.selectedIndex];
+  if (selected === undefined) return { state };
   const staged = new Set(state.staged);
   if (staged.has(selected.name)) staged.delete(selected.name);
   else staged.add(selected.name);
@@ -133,14 +135,21 @@ export function reduceToolManagerState(
 function decodeFilterText(data: string): string | undefined {
   const kitty = decodeKittyPrintable(data);
   if (kitty) return kitty;
-  return /^[^\u0000-\u001f\u007f]+$/u.test(data) ? data : undefined;
+
+  for (const character of data) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === undefined || codePoint <= 0x1f || codePoint === 0x7f) {
+      return undefined;
+    }
+  }
+  return data || undefined;
 }
 
 class ToolManagerComponent implements Component {
   private state: ToolManagerState;
 
   constructor(
-    private readonly tui: any,
+    private readonly tui: Pick<TUI, "requestRender">,
     private readonly theme: Theme,
     private readonly rows: ToolManagerRow[],
     state: ToolManagerState,
@@ -240,6 +249,7 @@ class ToolManagerComponent implements Component {
     } else {
       for (let index = 0; index < shown.length; index++) {
         const row = shown[index];
+        if (row === undefined) continue;
         const absoluteIndex = start + index;
         const selected = absoluteIndex === this.state.selectedIndex;
         const cursor = selected ? this.theme.fg("accent", ">") : " ";

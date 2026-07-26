@@ -59,9 +59,9 @@ const BORDERS: Record<BorderStyle, BorderChars> = {
 };
 
 export class Panel implements Component {
-  private readonly title?: string | Component;
+  private readonly title: string | Component | undefined;
   private readonly body: Component;
-  private readonly footer?: Component;
+  private readonly footer: Component | undefined;
   private readonly styleBorder: (text: string) => string;
   private readonly styleTitle: (text: string) => string;
   private readonly borderStyle: BorderStyle;
@@ -128,7 +128,7 @@ export class Panel implements Component {
     const styledTitle =
       typeof this.title === "string"
         ? this.styleTitle(this.title)
-        : this.title.render(innerWidth)[0] ?? "";
+        : (this.title.render(innerWidth)[0] ?? "");
     const titleWidth = visibleWidth(styledTitle);
     const fillWidth = Math.max(0, innerWidth - titleWidth - 2);
     const leftFill = Math.floor(fillWidth / 2);
@@ -168,7 +168,9 @@ export class Panel implements Component {
       ) +
       " ".repeat(this.padding);
     const inner = truncateToWidth(padded, innerWidth, "", true);
-    return this.styleBorder(border.left) + inner + this.styleBorder(border.right);
+    return (
+      this.styleBorder(border.left) + inner + this.styleBorder(border.right)
+    );
   }
 
   private renderFooterLine(border: BorderChars, innerWidth: number): string {

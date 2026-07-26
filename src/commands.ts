@@ -5,23 +5,31 @@
  * Each subcommand is a named handler dispatched from the top-level command.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import {
+  buildEffectiveConfig,
   getGlobalConfigPath,
   getProjectConfigPath,
-  writeToolbeltConfig,
-  buildEffectiveConfig,
   hasConfigError,
   isEnabled,
+  writeToolbeltConfig,
 } from "./config.js";
-import { BACKEND_ID, COMMAND_NAME, DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
-import type { DiscoveryReceipt, ToolbeltConfig } from "./types.js";
+import {
+  BACKEND_ID,
+  DEFAULT_CONFIG,
+  FLAG_DEBUG,
+  LOADER_TOOL_NAME,
+} from "./constants.js";
 import {
   filterRegisteredTools,
   isDiscoveryReceipt,
   persistActiveTools,
 } from "./session.js";
 import { openToolManager } from "./tool-manager.js";
+import type { DiscoveryReceipt, ToolbeltConfig } from "./types.js";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -155,15 +163,15 @@ async function handleSetup(
   }
 
   const debug = !!pi.getFlag(FLAG_DEBUG);
-  ctx.ui.notify(buildSetupReport(targetPath, newEffective, active, debug), "info");
+  ctx.ui.notify(
+    buildSetupReport(targetPath, newEffective, active, debug),
+    "info",
+  );
 }
 
 // ── Confirm message builder ───────────────────────────────────────
 
-function buildSetupConfirm(
-  targetPath: string,
-  config: ToolbeltConfig,
-): string {
+function buildSetupConfirm(targetPath: string, config: ToolbeltConfig): string {
   const lines: string[] = [
     "Toolbelt will apply the following changes:",
     "",
@@ -195,7 +203,9 @@ function buildSetupReport(
     `Active tools now: ${active.length} (${active.join(", ")})`,
   ];
   if (debug) {
-    lines.push(`Threshold: ${effective.threshold}  |  Top-K: ${effective.topK}`);
+    lines.push(
+      `Threshold: ${effective.threshold}  |  Top-K: ${effective.topK}`,
+    );
   }
   return lines.join("\n");
 }
@@ -262,10 +272,12 @@ async function handleStatus(
   const branch = ctx.sessionManager?.getBranch?.() ?? [];
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
+    if (entry === undefined || entry.type !== "message") {
+      continue;
+    }
     if (
-      entry.type === "message" &&
-      entry.message?.role === "toolResult" &&
-      entry.message?.toolName === LOADER_TOOL_NAME &&
+      entry.message.role === "toolResult" &&
+      entry.message.toolName === LOADER_TOOL_NAME &&
       isDiscoveryReceipt(entry.message.details)
     ) {
       lastReceipt = entry.message.details;
@@ -335,7 +347,7 @@ async function handleReset(
   }
 
   const requested = filterRegisteredTools(pi, effective.baseline);
-  let change;
+  let change: ReturnType<typeof persistActiveTools>;
   try {
     change = persistActiveTools(pi, requested);
   } catch (error) {
@@ -350,8 +362,10 @@ async function handleReset(
 
   if (change.removed.length > 0 || change.added.length > 0) {
     const lines = ["✓ Toolbelt reset"];
-    if (change.added.length > 0) lines.push(`Added: ${change.added.join(", ")}`);
-    if (change.removed.length > 0) lines.push(`Removed: ${change.removed.join(", ")}`);
+    if (change.added.length > 0)
+      lines.push(`Added: ${change.added.join(", ")}`);
+    if (change.removed.length > 0)
+      lines.push(`Removed: ${change.removed.join(", ")}`);
     lines.push(
       `Active: ${change.after.length} tools (${change.after.join(", ") || "none"})`,
     );

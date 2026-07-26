@@ -1,11 +1,15 @@
 /** Pi Toolbelt type definitions. */
 
-/** User-facing configuration schema for toolbelt.json. */
-export interface ToolbeltConfig {
-  baseline: string[];
-  threshold: number;
-  topK: number;
-}
+// Schema-derived public types (validated shapes live in schemas.ts).
+export type {
+  ActiveToolSnapshot,
+  DiscoveryReceipt,
+  ToolbeltConfig,
+  ToolDiscoveryResult,
+  ToolManagementAction,
+} from "./schemas.js";
+
+import type { ToolbeltConfig, ToolManagementAction } from "./schemas.js";
 
 /** Resolved configuration combining global + project sources. */
 export interface EffectiveConfig {
@@ -38,12 +42,6 @@ export interface SearchBackend {
   getCatalogHash(): string;
 }
 
-/** Complete active-set state persisted in custom session entry. */
-export interface ActiveToolSnapshot {
-  version: 1;
-  active: string[];
-}
-
 /** Observable result of one persisted active-set replacement. */
 export interface ActiveToolChange {
   before: string[];
@@ -51,22 +49,6 @@ export interface ActiveToolChange {
   added: string[];
   removed: string[];
 }
-
-/** A ranked discovery result annotated with current active membership. */
-export interface ToolDiscoveryResult extends ToolRanking {
-  active: boolean;
-}
-
-/** Discovery-only receipt persisted in query_tools result details. */
-export interface DiscoveryReceipt {
-  query: string;
-  backend: string;
-  rankings: ToolDiscoveryResult[];
-  activeCounts: { before: number; after: number };
-  catalogHash: string;
-}
-
-export type ToolManagementAction = "activate" | "deactivate";
 
 /** Details returned by one explicit model-side active-set mutation. */
 export interface ToolManagementReceipt extends ActiveToolChange {

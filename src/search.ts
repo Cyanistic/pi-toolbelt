@@ -64,11 +64,7 @@ export class SearchEngine implements SearchBackend {
    * Returns ranked results with fuse.js scores (0 = perfect, 1 = no match),
    * post-filtered by the configured threshold and capped at topK.
    */
-  search(
-    query: string,
-    threshold: number,
-    topK: number,
-  ): ToolRanking[] {
+  search(query: string, threshold: number, topK: number): ToolRanking[] {
     // Fuse is initialized with threshold 1.0, so we get all candidates.
     // Post-filter by the configured threshold.
     const results = this.fuse.search(query, { limit: topK * 3 }); // generous pre-filter
@@ -89,7 +85,10 @@ export class SearchEngine implements SearchBackend {
 
 function computeCatalogHash(tools: IndexedTool[]): string {
   // Hash name + description so description-only changes invalidate index.
-  const pairs = tools.map((t) => `${t.name}::${t.description}`).sort().join("|");
+  const pairs = tools
+    .map((t) => `${t.name}::${t.description}`)
+    .sort()
+    .join("|");
   return pairs;
 }
 
