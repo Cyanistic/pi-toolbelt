@@ -1,20 +1,15 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
-
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - Scope one independently mergeable behavior change.
+    - If the request contains multiple independently mergeable outcomes with their own sequencing or design decisions, recommend the initiative workflow instead of forcing them into one change.
+  tasks:
+    - Organize implementation under numbered vertical-slice headings.
+    - Each slice must end in independently observable behavior through the public extension workflow.
+    - Keep contracts, implementation, integration, and verification in the same slice.
+    - Order slices by dependency and prefer the smallest useful end-to-end behavior first.
+    - Leave npm run check passing after every slice.
+    - Include the relevant repeatable real Pi verification flow in each slice.
+    - Use one slice for trivial changes rather than manufacturing extra phases.
+    - Treat each slice as a potential commit boundary.

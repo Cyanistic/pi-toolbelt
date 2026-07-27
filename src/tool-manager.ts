@@ -1,10 +1,12 @@
 /**
  * Keyboard-driven staged tool manager for /toolbelt tools.
  *
- * State is deterministic and independently testable. The modal component
- * wraps state transitions and delegates rendering to the same stateless
- * helpers. No active-set mutation happens inside this module — the caller
- * receives a confirm or cancel result and applies it.
+ * Non-overlay session frame shared with Settings. Tracks applied vs staged
+ * sets; Enter applies via callback and stays open; Escape asks the caller
+ * to confirm discard when dirty. Always editable regardless of config.
+ *
+ * Interaction patterns from the validated Toolbelt settings prototype
+ * Tools Manager screen and @aliou/pi-utils-settings 0.17.0 chrome.
  */
 
 import type {
@@ -20,7 +22,8 @@ import {
   type TUI,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import { Panel } from "./panel.js";
+import { getSettingsTheme, type SettingsTheme } from "./ui/settings-theme.js";
+import { ToolbeltFrame } from "./ui/toolbelt-frame.js";
 
 export interface ToolManagerRow {
   name: string;
@@ -30,20 +33,18 @@ export interface ToolManagerRow {
 export interface ToolManagerState {
   filter: string;
   selectedIndex: number;
+  /** Last successfully applied active set. */
+  applied: string[];
+  /** Working toggles; Enter applies via onApply. */
   staged: string[];
-  readOnly: boolean;
+  status: string;
 }
 
 export type ToolManagerResult =
-  | { kind: "confirm"; active: string[] }
-  | { kind: "cancel" };
+  | { kind: "close" }
+  | { kind: "discard-request"; state: ToolManagerState };
 
-export type ToolManagerAction =
-  | { type: "filter"; value: string }
-  | { type: "move"; delta: -1 | 1 }
-  | { type: "toggle" }
-  | { type: "confirm" }
-  | { type: "cancel" };
+export type ApplyResult = { ok: true } | { ok: false; error: string };
 
 export function buildToolManagerRows(tools: ToolInfo[]): ToolManagerRow[] {
   return tools.map((tool) => ({
@@ -55,14 +56,17 @@ export function buildToolManagerRows(tools: ToolInfo[]): ToolManagerRow[] {
 export function createToolManagerState(
   rows: ToolManagerRow[],
   activeNames: readonly string[],
-  readOnly: boolean,
 ): ToolManagerState {
   const registered = new Set(rows.map((row) => row.name));
+  const applied = [...new Set(activeNames)].filter((name) =>
+    registered.has(name),
+  );
   return {
     filter: "",
     selectedIndex: 0,
-    staged: [...new Set(activeNames)].filter((name) => registered.has(name)),
-    readOnly,
+    applied: [...applied],
+    staged: [...applied],
+    status: "Space stages changes. Enter applies. Esc closes.",
   };
 }
 
@@ -77,59 +81,14 @@ export function filterToolRows(
   );
 }
 
-export function selectedActiveNames(
-  rows: ToolManagerRow[],
-  state: ToolManagerState,
-): string[] {
-  const staged = new Set(state.staged);
-  return rows.filter((row) => staged.has(row.name)).map((row) => row.name);
+function setsEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setB = new Set(b);
+  return a.every((x) => setB.has(x));
 }
 
-export function reduceToolManagerState(
-  rows: ToolManagerRow[],
-  state: ToolManagerState,
-  action: ToolManagerAction,
-): { state: ToolManagerState; result?: ToolManagerResult } {
-  if (action.type === "cancel") {
-    return { state, result: { kind: "cancel" } };
-  }
-  if (action.type === "confirm") {
-    return state.readOnly
-      ? { state, result: { kind: "cancel" } }
-      : {
-          state,
-          result: { kind: "confirm", active: selectedActiveNames(rows, state) },
-        };
-  }
-  if (action.type === "filter") {
-    return {
-      state: { ...state, filter: action.value, selectedIndex: 0 },
-    };
-  }
-
-  const visible = filterToolRows(rows, state.filter);
-  if (action.type === "move") {
-    return {
-      state: {
-        ...state,
-        selectedIndex: Math.max(
-          0,
-          Math.min(
-            Math.max(0, visible.length - 1),
-            state.selectedIndex + action.delta,
-          ),
-        ),
-      },
-    };
-  }
-  if (state.readOnly || visible.length === 0) return { state };
-
-  const selected = visible[state.selectedIndex];
-  if (selected === undefined) return { state };
-  const staged = new Set(state.staged);
-  if (staged.has(selected.name)) staged.delete(selected.name);
-  else staged.add(selected.name);
-  return { state: { ...state, staged: [...staged] } };
+function isDirty(state: ToolManagerState): boolean {
+  return !setsEqual(state.staged, state.applied);
 }
 
 function decodeFilterText(data: string): string | undefined {
@@ -145,140 +104,246 @@ function decodeFilterText(data: string): string | undefined {
   return data || undefined;
 }
 
+function fit(line: string, width: number): string {
+  return truncateToWidth(line, Math.max(1, width), "", true);
+}
+
+function cloneState(state: ToolManagerState): ToolManagerState {
+  return {
+    filter: state.filter,
+    selectedIndex: state.selectedIndex,
+    applied: [...state.applied],
+    staged: [...state.staged],
+    status: state.status,
+  };
+}
+
 class ToolManagerComponent implements Component {
   private state: ToolManagerState;
+  private readonly theme: SettingsTheme;
+  private applying = false;
 
   constructor(
     private readonly tui: Pick<TUI, "requestRender">,
-    private readonly theme: Theme,
+    theme: Theme,
     private readonly rows: ToolManagerRow[],
     state: ToolManagerState,
+    private readonly onApply: (active: string[]) => Promise<ApplyResult>,
     private readonly done: (result: ToolManagerResult) => void,
   ) {
+    this.theme = getSettingsTheme(theme);
     this.state = state;
-  }
-
-  private dispatch(action: ToolManagerAction): void {
-    const next = reduceToolManagerState(this.rows, this.state, action);
-    this.state = next.state;
-    if (next.result) this.done(next.result);
-    else this.tui.requestRender();
-  }
-
-  handleInput(data: string): void {
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-      this.dispatch({ type: "cancel" });
-    } else if (matchesKey(data, Key.enter)) {
-      this.dispatch({ type: "confirm" });
-    } else if (matchesKey(data, Key.up)) {
-      this.dispatch({ type: "move", delta: -1 });
-    } else if (matchesKey(data, Key.down)) {
-      this.dispatch({ type: "move", delta: 1 });
-    } else if (matchesKey(data, Key.space)) {
-      this.dispatch({ type: "toggle" });
-    } else if (matchesKey(data, Key.ctrl("u"))) {
-      this.dispatch({ type: "filter", value: "" });
-    } else if (matchesKey(data, Key.backspace)) {
-      const chars = Array.from(this.state.filter);
-      chars.pop();
-      this.dispatch({ type: "filter", value: chars.join("") });
-    } else {
-      const printable = decodeFilterText(data);
-      if (printable) {
-        this.dispatch({ type: "filter", value: this.state.filter + printable });
-      }
-    }
   }
 
   invalidate(): void {}
 
+  handleInput(data: string): void {
+    if (this.applying) return;
+
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      if (isDirty(this.state)) {
+        this.done({
+          kind: "discard-request",
+          state: cloneState(this.state),
+        });
+      } else {
+        this.done({ kind: "close" });
+      }
+      return;
+    }
+
+    if (matchesKey(data, Key.enter)) {
+      void this.apply();
+      return;
+    }
+
+    if (matchesKey(data, Key.up)) {
+      const visible = filterToolRows(this.rows, this.state.filter);
+      if (visible.length === 0) return;
+      this.state.selectedIndex =
+        this.state.selectedIndex === 0
+          ? visible.length - 1
+          : this.state.selectedIndex - 1;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.down)) {
+      const visible = filterToolRows(this.rows, this.state.filter);
+      if (visible.length === 0) return;
+      this.state.selectedIndex =
+        this.state.selectedIndex === visible.length - 1
+          ? 0
+          : this.state.selectedIndex + 1;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.space)) {
+      const visible = filterToolRows(this.rows, this.state.filter);
+      const row = visible[this.state.selectedIndex];
+      if (row === undefined) return;
+      const staged = new Set(this.state.staged);
+      if (staged.has(row.name)) staged.delete(row.name);
+      else staged.add(row.name);
+      // Preserve registered order for staged names.
+      this.state.staged = this.rows
+        .map((r) => r.name)
+        .filter((name) => staged.has(name));
+      // Also keep any staged names not in rows (shouldn't happen).
+      for (const name of staged) {
+        if (!this.state.staged.includes(name)) this.state.staged.push(name);
+      }
+      this.state.status = `Staged toggle: ${row.name}`;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.ctrl("u"))) {
+      this.state.filter = "";
+      this.state.selectedIndex = 0;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.backspace)) {
+      const chars = Array.from(this.state.filter);
+      chars.pop();
+      this.state.filter = chars.join("");
+      this.state.selectedIndex = 0;
+      this.tui.requestRender();
+      return;
+    }
+
+    const printable = decodeFilterText(data);
+    if (printable !== undefined) {
+      this.state.filter += printable;
+      this.state.selectedIndex = 0;
+      this.tui.requestRender();
+    }
+  }
+
   render(width: number): string[] {
-    const panel = new Panel({
+    const frame = new ToolbeltFrame({
       title: "Toolbelt Tools",
+      theme: this.theme,
+      tabs: { kind: "session" },
       body: {
-        render: (contentWidth: number) => this.renderBody(contentWidth),
-        invalidate() {},
+        invalidate: () => {},
+        render: (w) => this.renderBody(w),
       },
-      border: "round",
-      padding: 1,
-      borderStyle: (text: string) => this.theme.fg("border", text),
-      titleStyle: (text: string) =>
-        this.theme.fg("accent", this.theme.bold(text)),
+      status: this.state.status,
+      footer:
+        "Type filter · Backspace/^U · Up/Down · Space stage · Enter apply · Esc close",
     });
-    return panel.render(width);
+    return frame.render(width);
+  }
+
+  private async apply(): Promise<void> {
+    if (this.applying) return;
+    this.applying = true;
+    const active = [...this.state.staged];
+    this.state.status = "Applying...";
+    this.tui.requestRender();
+
+    let result: ApplyResult;
+    try {
+      result = await this.onApply(active);
+    } catch (error) {
+      result = {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    this.applying = false;
+    if (result.ok) {
+      this.state.applied = [...active];
+      this.state.staged = [...active];
+      this.state.status = `Applied ${active.length} tools. Snapshot persisted.`;
+    } else {
+      this.state.status = `Apply failed: ${result.error}`;
+    }
+    this.tui.requestRender();
   }
 
   private renderBody(width: number): string[] {
     const visible = filterToolRows(this.rows, this.state.filter);
     const staged = new Set(this.state.staged);
-    const viewport = 14;
-    const start = Math.max(
-      0,
-      Math.min(
-        this.state.selectedIndex - Math.floor(viewport / 2),
-        Math.max(0, visible.length - viewport),
-      ),
-    );
-    const shown = visible.slice(start, start + viewport);
+    const applied = new Set(this.state.applied);
+    const unapplied = isDirty(this.state);
     const lines: string[] = [];
 
-    if (this.state.readOnly) {
-      lines.push(
-        this.theme.fg(
-          "warning",
-          "Read only: run /toolbelt setup global or /toolbelt setup project to enable changes.",
-        ),
-        "",
-      );
-    }
-
     lines.push(
-      this.theme.fg(
-        "muted",
-        `Filter: ${this.state.filter || "(type to filter)"}`,
+      fit(
+        this.theme.fg(
+          "muted",
+          `Filter: ${this.state.filter || "(type to filter)"}`,
+        ),
+        width,
       ),
-      this.theme.fg(
-        "dim",
-        `${visible.length} of ${this.rows.length} registered tools`,
-      ),
-      "",
     );
+    lines.push(
+      fit(
+        this.theme.fg(
+          "dim",
+          `${visible.length}/${this.rows.length} tools · staged ${this.state.staged.length} · applied ${this.state.applied.length}${unapplied ? " · unapplied changes" : " · in sync"}`,
+        ),
+        width,
+      ),
+    );
+    lines.push("");
 
-    if (shown.length === 0) {
-      lines.push(this.theme.fg("warning", "  No matching tools"));
+    if (visible.length === 0) {
+      lines.push(fit(this.theme.fg("warning", "  No matching tools"), width));
     } else {
-      for (let index = 0; index < shown.length; index++) {
-        const row = shown[index];
+      const viewport = 12;
+      const start = Math.max(
+        0,
+        Math.min(
+          this.state.selectedIndex - Math.floor(viewport / 2),
+          Math.max(0, visible.length - viewport),
+        ),
+      );
+      const end = Math.min(start + viewport, visible.length);
+      for (let i = start; i < end; i++) {
+        const row = visible[i];
         if (row === undefined) continue;
-        const absoluteIndex = start + index;
-        const selected = absoluteIndex === this.state.selectedIndex;
-        const cursor = selected ? this.theme.fg("accent", ">") : " ";
-        const marker = staged.has(row.name) ? "[x]" : "[ ]";
-        const name = selected
+        const sel = i === this.state.selectedIndex;
+        const cursor = sel ? this.theme.fg("accent", ">") : " ";
+        const box = staged.has(row.name) ? "[x]" : "[ ]";
+        const addMark =
+          !applied.has(row.name) && staged.has(row.name)
+            ? this.theme.fg("warning", " +")
+            : "";
+        const removeMark =
+          applied.has(row.name) && !staged.has(row.name)
+            ? this.theme.fg("warning", " -")
+            : "";
+        const name = sel
           ? this.theme.fg("accent", this.theme.bold(row.name))
           : this.theme.fg("text", row.name);
+        const desc =
+          row.description.length > 0
+            ? this.theme.fg("muted", `  ${row.description}`)
+            : "";
         lines.push(
-          truncateToWidth(
-            `${cursor} ${marker} ${name}${
-              row.description
-                ? ` - ${this.theme.fg("muted", row.description)}`
-                : ""
-            }`,
-            Math.max(1, width),
+          fit(`${cursor} ${box} ${name}${addMark}${removeMark}${desc}`, width),
+        );
+      }
+      if (visible.length > viewport) {
+        lines.push(
+          fit(
+            this.theme.fg(
+              "dim",
+              `  (${this.state.selectedIndex + 1}/${visible.length})`,
+            ),
+            width,
           ),
         );
       }
     }
 
-    lines.push(
-      "",
-      this.theme.fg(
-        "dim",
-        this.state.readOnly
-          ? "Type filter | Up/Down navigate | Esc/Enter close"
-          : "Type filter | Backspace/Ctrl-U edit | Up/Down navigate | Space toggle | Enter apply | Esc cancel",
-      ),
-    );
     return lines;
   }
 }
@@ -287,16 +352,18 @@ export async function openToolManager(
   ctx: ExtensionCommandContext,
   tools: ToolInfo[],
   activeNames: readonly string[],
-  readOnly: boolean,
+  options: {
+    initialState?: ToolManagerState;
+    onApply: (active: string[]) => Promise<ApplyResult>;
+  },
 ): Promise<ToolManagerResult> {
   const rows = buildToolManagerRows(tools);
-  const state = createToolManagerState(rows, activeNames, readOnly);
+  const state =
+    options.initialState ?? createToolManagerState(rows, activeNames);
+
   return ctx.ui.custom<ToolManagerResult>(
     (tui, theme, _keybindings, done) =>
-      new ToolManagerComponent(tui, theme, rows, state, done),
-    {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: 76, maxHeight: 28 },
-    },
+      new ToolManagerComponent(tui, theme, rows, state, options.onApply, done),
+    // Non-overlay: replaces composer at bottom, grows upward.
   );
 }

@@ -2,9 +2,9 @@
  * pi-toolbelt: discovery and explicit session tool management for Pi.
  *
  * Registers query_tools, manage_tools, and the /toolbelt command family
- * unconditionally. Config validity gates every active-set mutation, while the
- * tools command remains available read-only before setup. Session start applies
- * the registered configured baseline or the newest exact active-set snapshot.
+ * unconditionally. Runtime mode (configured / session-only / inactive) is
+ * derived from trust-aware effective config plus the newest valid session
+ * snapshot. Active-set mutations stay persistence-first.
  */
 
 import type {
@@ -31,7 +31,12 @@ function autocompleteItem(
 }
 
 import { handleToolbeltCommand } from "./commands.js";
-import { buildEffectiveConfig, hasConfigError, isEnabled } from "./config.js";
+import {
+  buildEffectiveConfig,
+  configErrorMessages,
+  hasConfigError,
+  resolveRuntimeMode,
+} from "./config.js";
 import {
   BACKEND_ID_BM25,
   BACKEND_ID_LLM,
@@ -49,34 +54,33 @@ import { ManageToolsParamsSchema, QueryToolsParamsSchema } from "./schemas.js";
 import { buildToolIndex, SearchEngine } from "./search.js";
 import {
   filterRegisteredTools,
+  hasActiveToolSnapshot,
   persistActiveTools,
   restoreActiveToolSnapshot,
 } from "./session.js";
+import type { EffectiveConfig, RuntimeMode, SearchConfig } from "./types.js";
 
 /** Completion tree: each node maps a token to the next level. */
 interface CompletionNode {
   description?: string;
-  /** Null/undefined at leaves — no further completions. */
+  /** Null/undefined at leaves - no further completions. */
   children?: Record<string, CompletionNode>;
 }
 
 const COMPS: Record<string, CompletionNode> = {
-  setup: {
-    description: "Create config and apply baseline",
-    children: {
-      global: { description: "Write ~/.pi/agent/toolbelt.json" },
-      project: { description: "Write .pi/toolbelt.json" },
-    },
-  },
+  settings: { description: "Edit persistent configuration" },
   tools: { description: "Inspect and change active session tools" },
   status: { description: "Show current toolbelt state" },
   reset: { description: "Restore configured baseline" },
 };
 
+const INACTIVE_GUIDANCE =
+  "Toolbelt is inactive. Use /toolbelt tools to establish a session tool set, or /toolbelt settings to create configuration.";
+
 export default function (pi: ExtensionAPI) {
   let searchEngine: SearchEngine | null = null;
-  let currentEffectiveConfig: ReturnType<typeof buildEffectiveConfig> | null =
-    null;
+  /** Latest resolved runtime mode for this session. */
+  let currentRuntime: RuntimeMode | null = null;
 
   pi.registerFlag(FLAG_DEBUG, {
     description: "Show verbose toolbelt debug output",
@@ -86,8 +90,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /toolbelt command ──────────────────────────────────────────
   pi.registerCommand(COMMAND_NAME, {
-    description:
-      "Toolbelt: setup, inspect, manage, status, and reset session tools",
+    description: "Toolbelt: settings, tools, status, and reset session tools",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const trimmed = prefix.trimStart();
       const tokens = trimmed.split(/\s+/);
@@ -116,7 +119,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (endsWithSpace) {
-        // User finished a token (trailing space) — show next level
+        // User finished a token (trailing space) - show next level
         const entries = Object.entries(root);
         if (entries.length === 0) return null;
         return entries.map(([value, child]) =>
@@ -138,19 +141,45 @@ export default function (pi: ExtensionAPI) {
       );
     },
     handler: async (args, ctx) => {
-      await handleToolbeltCommand(args, pi, ctx);
+      await handleToolbeltCommand(args, pi, ctx, {
+        onRuntimeInvalidate: () => {
+          currentRuntime = refreshRuntime(ctx);
+        },
+      });
 
-      // Hot-reload: always re-evaluate config after command so manual
-      // edits and setup/reset are reflected immediately without a new
-      // session. This is the only place currentEffectiveConfig is
-      // updated outside of session_start. If session_start gating
-      // logic evolves, this path must be updated in lockstep.
-      const fresh = buildEffectiveConfig(ctx.cwd);
-      currentEffectiveConfig = isEnabled(fresh) ? fresh : null;
+      // Hot-reload runtime mode after every command so settings/tools/reset
+      // and external config edits are reflected without a new session.
+      currentRuntime = refreshRuntime(ctx);
     },
   });
 
   // ── Helpers ────────────────────────────────────────────────────
+
+  function projectTrusted(ctx: ExtensionContext): boolean {
+    return ctx.isProjectTrusted?.() ?? false;
+  }
+
+  function refreshRuntime(ctx: ExtensionContext): RuntimeMode {
+    const effective = buildEffectiveConfig(ctx.cwd, projectTrusted(ctx));
+    return resolveRuntimeMode(effective, hasActiveToolSnapshot(ctx));
+  }
+
+  function ensureRuntime(ctx?: ExtensionContext): RuntimeMode | null {
+    if (ctx) {
+      currentRuntime = refreshRuntime(ctx);
+    }
+    return currentRuntime;
+  }
+
+  /**
+   * Effective search for the current runtime.
+   * Session-only always forces default BM25; configured uses config search.
+   */
+  function runtimeSearch(runtime: RuntimeMode): SearchConfig | null {
+    if (runtime.mode === "inactive") return null;
+    if (runtime.mode === "session-only") return { type: "bm25" };
+    return runtime.effective.search;
+  }
 
   /**
    * Get the eligible tool catalog for indexing.
@@ -233,16 +262,15 @@ export default function (pi: ExtensionAPI) {
       const timeoutMs = params.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
 
       const active = pi.getActiveTools();
+      const runtime = ensureRuntime(_ctx);
 
-      // ── Not configured ──────────────────────────────────────────
-      if (!currentEffectiveConfig) {
+      // ── Inactive ────────────────────────────────────────────────
+      if (!runtime || runtime.mode === "inactive") {
         return {
           content: [
             {
               type: "text",
-              text:
-                "Toolbelt is not yet configured. " +
-                "Run /toolbelt setup to enable tool discovery.",
+              text: INACTIVE_GUIDANCE,
             },
           ],
           details: {
@@ -256,10 +284,22 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // ── Determine search backend ─────────────────────────────────
-      const isLLM = currentEffectiveConfig.search.type === "llm";
-      const isProjectSearch = currentEffectiveConfig.searchSource === "project";
-      const projectTrusted = _ctx?.isProjectTrusted?.() ?? false;
+      const search = runtimeSearch(runtime);
+      if (!search) {
+        return {
+          content: [{ type: "text", text: INACTIVE_GUIDANCE }],
+          details: {
+            kind: "ranked",
+            requestedBackend: BACKEND_ID_BM25,
+            actualBackend: BACKEND_ID_BM25,
+            rankings: [] as Array<ToolDiscoveryResult>,
+            activeCounts: { before: active.length, after: active.length },
+            catalogHash: "",
+          },
+        };
+      }
+
+      const isLLM = search.type === "llm";
 
       // Collect eligible catalog for LLM mode
       const allTools = pi.getAllTools();
@@ -269,7 +309,7 @@ export default function (pi: ExtensionAPI) {
         : allTools.filter((t) => !activeNamesSet.has(t.name));
 
       if (!isLLM) {
-        // ── BM25 mode ──────────────────────────────────────────────
+        // ── BM25 mode (configured BM25 or any session-only) ────────
         const { rankings, catalogHash } = bm25Search(
           query,
           includeActive,
@@ -328,58 +368,9 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // ── LLM mode ─────────────────────────────────────────────────
+      // ── LLM mode (configured only - session-only never reaches here) ─
       const requestedBackend = BACKEND_ID_LLM;
-      const configuredModel =
-        currentEffectiveConfig.search.type === "llm"
-          ? currentEffectiveConfig.search.model
-          : undefined;
-
-      // Check project trust for project-selected LLM
-      if (isProjectSearch && !projectTrusted) {
-        // Fall back to BM25: untrusted project
-        const { rankings, catalogHash } = bm25Search(
-          query,
-          includeActive,
-          limit,
-        );
-
-        const fallbackReason =
-          "project-selected LLM rejected: project is not trusted";
-
-        const resultText =
-          rankings.length > 0
-            ? rankings
-                .map(
-                  ({ rank, name, description, active: isActive }) =>
-                    `${rank}. ${name}${isActive ? "" : " (inactive)"}${description ? ` - ${description}` : ""}`,
-                )
-                .join("\n")
-            : `No tools matched "${query}".`;
-
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `[LLM unavailable - ${fallbackReason}]\n\n` +
-                `BM25 fallback results:\n${resultText}`,
-            },
-          ],
-          details: {
-            kind: "ranked" as const,
-            requestedBackend,
-            actualBackend: BACKEND_ID_BM25,
-            fallbackReason,
-            rankings,
-            activeCounts: {
-              before: active.length,
-              after: active.length,
-            },
-            catalogHash,
-          },
-        };
-      }
+      const configuredModel = search.model;
 
       // Attempt LLM ranking
       const catalogWithActive = eligible.map((t) => ({
@@ -405,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 
       if (llmError) {
         if (llmError.code === "cancelled") {
-          // Parent cancellation — stop without fallback
+          // Parent cancellation - stop without fallback
           return {
             content: [
               {
@@ -427,7 +418,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // Recoverable failure — fall back to BM25
+        // Recoverable failure - fall back to BM25
         const { rankings, catalogHash } = bm25Search(
           query,
           includeActive,
@@ -519,11 +510,15 @@ export default function (pi: ExtensionAPI) {
     async execute(
       _toolCallId: string,
       params: import("./schemas.js").ManageToolsParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      _ctx: ExtensionContext,
     ) {
-      if (!currentEffectiveConfig) {
-        throw new Error(
-          "Toolbelt is not configured. Run /toolbelt setup before changing active tools.",
-        );
+      const runtime = ensureRuntime(_ctx);
+
+      // Refuse before any persistence or active-set mutation.
+      if (!runtime || runtime.mode === "inactive") {
+        throw new Error(INACTIVE_GUIDANCE);
       }
 
       const { action } = params;
@@ -553,6 +548,13 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      // Successful mutation establishes/refreshes snapshot evidence.
+      if (_ctx) {
+        currentRuntime = refreshRuntime(_ctx);
+      } else if (currentRuntime) {
+        currentRuntime = resolveRuntimeMode(currentRuntime.effective, true);
+      }
+
       const changed = action === "activate" ? change.added : change.removed;
       return {
         content: [
@@ -576,42 +578,69 @@ export default function (pi: ExtensionAPI) {
 
   // ── Session lifecycle ──────────────────────────────────────────
   pi.on("session_start", async (event, ctx) => {
-    const effective = buildEffectiveConfig(ctx.cwd);
+    const effective = buildEffectiveConfig(ctx.cwd, projectTrusted(ctx));
     const debug = !!pi.getFlag(FLAG_DEBUG);
 
     if (hasConfigError(effective)) {
-      const errors = [effective.globalError, effective.projectError].filter(
-        (error): error is string => typeof error === "string",
-      );
+      const errors = configErrorMessages(effective);
       ctx.ui.notify(`[toolbelt] ${errors.join("; ")}`, "warning");
     }
 
-    if (!isEnabled(effective)) {
-      currentEffectiveConfig = null;
-      if (debug) {
-        ctx.ui.notify("[toolbelt] disabled - no valid config found", "info");
-      }
-      return;
+    if (effective.project.state === "ignored" && debug) {
+      ctx.ui.notify(
+        `[toolbelt] Project config ignored (untrusted): ${effective.projectPath}`,
+        "info",
+      );
     }
 
-    currentEffectiveConfig = effective;
     const isResume =
       event &&
       typeof event === "object" &&
       "reason" in event &&
       (event as { reason: string }).reason === "resume";
-    const configuredBaseline = filterRegisteredTools(pi, effective.baseline);
-    const restored = isResume ? restoreActiveToolSnapshot(pi, ctx) : undefined;
-    const active = restored ?? configuredBaseline;
-    pi.setActiveTools(active);
 
+    // Snapshot restores even when config is missing or malformed.
+    const restored = isResume ? restoreActiveToolSnapshot(pi, ctx) : undefined;
+
+    if (restored !== undefined) {
+      pi.setActiveTools(restored);
+      currentRuntime = resolveRuntimeMode(effective, true);
+      if (debug) {
+        ctx.ui.notify(
+          `[toolbelt] resume: ${restored.length} active tools from snapshot` +
+            (effective.configured
+              ? ` (config: ${effective.source})`
+              : " (session-only)"),
+          "info",
+        );
+      }
+      return;
+    }
+
+    // No snapshot: apply baseline only from valid effective config.
+    if (effective.configured) {
+      const active = filterRegisteredTools(pi, effective.baseline);
+      pi.setActiveTools(active);
+      currentRuntime = resolveRuntimeMode(effective, false);
+      if (debug) {
+        ctx.ui.notify(
+          `[toolbelt] configured baseline active: ${active.join(", ")} (source: ${effective.source})`,
+          "info",
+        );
+      }
+      return;
+    }
+
+    // Inactive: no mutation.
+    currentRuntime = resolveRuntimeMode(effective, false);
     if (debug) {
       ctx.ui.notify(
-        isResume
-          ? `[toolbelt] resume: ${active.length} active tools from ${restored ? "snapshot" : "configured baseline"}`
-          : `[toolbelt] configured baseline active: ${active.join(", ")} (source: ${effective.source})`,
+        "[toolbelt] inactive - no valid config and no session snapshot",
         "info",
       );
     }
   });
 }
+
+// Re-export types used by hot-reload callers / future modules.
+export type { EffectiveConfig, RuntimeMode };

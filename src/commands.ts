@@ -1,8 +1,9 @@
 /**
  * /toolbelt command dispatcher.
  *
- * Follows setup-command.ts:57-140 pattern: guard -> confirm -> write -> apply -> report.
- * Each subcommand is a named handler dispatched from the top-level command.
+ * Subcommands: settings, tools, status, reset.
+ * All paths load config through the trust-aware builder and share the
+ * runtime-mode resolver with session_start and tool gates.
  */
 
 import type {
@@ -11,24 +12,48 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   buildEffectiveConfig,
-  getGlobalConfigPath,
-  getProjectConfigPath,
+  configErrorMessages,
   hasConfigError,
   isEnabled,
-  writeToolbeltConfig,
+  resolveRuntimeMode,
 } from "./config.js";
-import { DEFAULT_CONFIG, FLAG_DEBUG, LOADER_TOOL_NAME } from "./constants.js";
+import { LOADER_TOOL_NAME } from "./constants.js";
 import {
   filterRegisteredTools,
+  hasActiveToolSnapshot,
   isDiscoveryReceipt,
   persistActiveTools,
 } from "./session.js";
-import { openToolManager } from "./tool-manager.js";
-import type { ToolbeltConfig } from "./types.js";
+import {
+  openSettingsUi,
+  type SettingsEditorState,
+  type SettingsUiResult,
+} from "./settings-ui.js";
+import {
+  openToolManager,
+  type ToolManagerResult,
+  type ToolManagerState,
+} from "./tool-manager.js";
+import type { RuntimeMode } from "./types.js";
 
 // ── Types ─────────────────────────────────────────────────────────
 
 type CommandContext = ExtensionCommandContext;
+
+/** Hooks from the extension entry so long-lived UIs can refresh runtime. */
+export interface ToolbeltCommandHooks {
+  /** Re-resolve configured/session-only/inactive after config or snapshot changes. */
+  onRuntimeInvalidate?: () => void;
+}
+
+function projectTrusted(ctx: CommandContext): boolean {
+  return ctx.isProjectTrusted?.() ?? false;
+}
+
+function loadRuntime(ctx: CommandContext): RuntimeMode {
+  const effective = buildEffectiveConfig(ctx.cwd, projectTrusted(ctx));
+  return resolveRuntimeMode(effective, hasActiveToolSnapshot(ctx));
+}
 
 // ── Top-level dispatch ────────────────────────────────────────────
 
@@ -36,6 +61,7 @@ export async function handleToolbeltCommand(
   args: string,
   pi: ExtensionAPI,
   ctx: CommandContext,
+  hooks: ToolbeltCommandHooks = {},
 ): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/toolbelt requires interactive mode", "error");
@@ -49,18 +75,18 @@ export async function handleToolbeltCommand(
     case "":
       ctx.ui.notify(
         "Toolbelt commands:\n" +
-          "  /toolbelt setup [global|project]  — create config and apply baseline\n" +
-          "  /toolbelt tools                   — inspect and change session tools\n" +
-          "  /toolbelt status                  — show current state\n" +
-          "  /toolbelt reset                   — restore configured baseline",
+          "  /toolbelt settings  - edit persistent configuration\n" +
+          "  /toolbelt tools     - inspect and change session tools\n" +
+          "  /toolbelt status    - show current state\n" +
+          "  /toolbelt reset     - restore configured baseline",
         "info",
       );
       break;
-    case "setup":
-      await handleSetup(parts.slice(1), pi, ctx);
+    case "settings":
+      await handleSettings(pi, ctx, hooks);
       break;
     case "tools":
-      await handleTools(pi, ctx);
+      await handleTools(pi, ctx, hooks);
       break;
     case "status":
       await handleStatus(pi, ctx);
@@ -70,148 +96,56 @@ export async function handleToolbeltCommand(
       break;
     default:
       ctx.ui.notify(
-        `Unknown subcommand: ${subcommand}. Valid subcommands: setup, tools, status, reset`,
+        `Unknown subcommand: ${subcommand}. Valid subcommands: settings, tools, status, reset`,
         "warning",
       );
   }
 }
 
-// ── Setup ─────────────────────────────────────────────────────────
+// ── Settings ──────────────────────────────────────────────────────
 
-async function handleSetup(
-  args: string[],
+async function handleSettings(
   pi: ExtensionAPI,
   ctx: CommandContext,
+  hooks: ToolbeltCommandHooks,
 ): Promise<void> {
-  // Resolve target scope
-  const scope = args[0]?.toLowerCase() ?? "";
-  const targetPath: string | null =
-    scope === "project"
-      ? getProjectConfigPath(ctx.cwd)
-      : scope === "global"
-        ? getGlobalConfigPath()
-        : null;
-
-  if (!targetPath) {
-    ctx.ui.notify(
-      "Usage: /toolbelt setup [global|project]\n\n" +
-        "  global   — write config to ~/.pi/agent/toolbelt.json (applies to all projects)\n" +
-        "  project  — write config to .pi/toolbelt.json (overrides global per-project)",
-      "info",
-    );
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("/toolbelt settings requires TUI mode", "error");
     return;
   }
 
-  // Check for existing config errors before proceeding
-  const effective = buildEffectiveConfig(ctx.cwd);
-  if (hasConfigError(effective)) {
-    ctx.ui.notify(
-      "Cannot run setup: existing config has errors. Fix or remove it first.",
-      "error",
+  let initialState: SettingsEditorState | undefined;
+
+  for (;;) {
+    const openOptions: {
+      initialState?: SettingsEditorState;
+      tools: ReturnType<ExtensionAPI["getAllTools"]>;
+      onConfigSaved: () => void;
+    } = {
+      tools: pi.getAllTools(),
+      onConfigSaved: () => {
+        // Refresh effective search/runtime immediately. Never mutates tools.
+        hooks.onRuntimeInvalidate?.();
+      },
+    };
+    if (initialState !== undefined) openOptions.initialState = initialState;
+
+    const result: SettingsUiResult = await openSettingsUi(ctx, openOptions);
+
+    if (result.kind === "close") {
+      return;
+    }
+
+    // discard-request: confirm outside the TUI input handler.
+    const discard = await ctx.ui.confirm(
+      "Discard settings changes?",
+      "You have unsaved configuration drafts. Discard them and close settings?",
     );
-    return;
+    if (discard) return;
+    initialState = result.editor;
+    // Ensure nested view is main so reopen is usable.
+    initialState.view = { kind: "main" };
   }
-
-  // Build config from defaults
-  const config: ToolbeltConfig = {
-    baseline: [...DEFAULT_CONFIG.baseline],
-    search: { type: "bm25" },
-  };
-
-  // Confirm before writing
-  const confirmed = await ctx.ui.confirm(
-    "Apply Toolbelt setup?",
-    buildSetupConfirm(targetPath, config),
-  );
-
-  if (!confirmed) {
-    ctx.ui.notify("Toolbelt setup cancelled", "info");
-    return;
-  }
-
-  // Write config file
-  try {
-    writeToolbeltConfig(targetPath, config);
-  } catch (e) {
-    ctx.ui.notify(
-      `Failed to write config: ${e instanceof Error ? e.message : String(e)}`,
-      "error",
-    );
-    return;
-  }
-
-  // Apply immediately: re-read effective config (includes what was just written)
-  const newEffective = buildEffectiveConfig(ctx.cwd);
-  const requested = filterRegisteredTools(pi, newEffective.baseline);
-  let active: string[];
-  try {
-    active = persistActiveTools(pi, requested).after;
-  } catch (error) {
-    ctx.ui.notify(
-      `Config was written, but active tools were not changed because the session snapshot could not be persisted: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-      "error",
-    );
-    return;
-  }
-
-  const debug = !!pi.getFlag(FLAG_DEBUG);
-  ctx.ui.notify(
-    buildSetupReport(targetPath, newEffective, active, debug),
-    "info",
-  );
-}
-
-// ── Confirm message builder ───────────────────────────────────────
-
-function buildSetupConfirm(targetPath: string, config: ToolbeltConfig): string {
-  const searchDesc =
-    config.search.type === "llm"
-      ? `LLM (model: ${config.search.model ?? "inherit active"})`
-      : "BM25 (local)";
-
-  const lines: string[] = [
-    "Toolbelt will apply the following changes:",
-    "",
-    `Config file: ${targetPath}`,
-    `Baseline tools: ${config.baseline.join(", ")}`,
-    `Discovery tool: ${LOADER_TOOL_NAME} (active only when included in baseline or enabled for the session)`,
-    `Search mode: ${searchDesc}`,
-    "",
-    "The configured baseline will be activated immediately.",
-    "Proceed?",
-  ];
-  return lines.join("\n");
-}
-
-// ── Success report builder ────────────────────────────────────────
-
-function buildSetupReport(
-  targetPath: string,
-  effective: ReturnType<typeof buildEffectiveConfig>,
-  active: string[],
-  debug: boolean,
-): string {
-  const searchDesc =
-    effective.search.type === "llm"
-      ? `LLM (model: ${effective.search.model ?? "inherit active"})`
-      : "BM25 (local)";
-
-  const lines: string[] = [
-    "✓ Toolbelt setup complete",
-    "",
-    `Config written: ${targetPath}`,
-    `Source: ${effective.source}`,
-    `Baseline: ${effective.baseline.join(", ")}`,
-    `Active tools now: ${active.length} (${active.join(", ")})`,
-  ];
-  if (debug) {
-    lines.push(
-      `Search mode: ${searchDesc} (source: ${effective.searchSource})`,
-    );
-  }
-  return lines.join("\n");
 }
 
 // ── Tools modal ───────────────────────────────────────────────────
@@ -219,36 +153,53 @@ function buildSetupReport(
 async function handleTools(
   pi: ExtensionAPI,
   ctx: CommandContext,
+  hooks: ToolbeltCommandHooks,
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("/toolbelt tools requires TUI mode", "error");
     return;
   }
 
-  const effective = buildEffectiveConfig(ctx.cwd);
-  const result = await openToolManager(
-    ctx,
-    pi.getAllTools(),
-    pi.getActiveTools(),
-    !isEnabled(effective),
-  );
-  if (result.kind === "cancel") return;
+  let initialState: ToolManagerState | undefined;
 
-  try {
-    const change = persistActiveTools(pi, result.active);
-    ctx.ui.notify(
-      change.added.length === 0 && change.removed.length === 0
-        ? `Toolbelt tools: active set unchanged (${change.after.length} tools).`
-        : `Toolbelt tools applied. Active: ${change.after.join(", ") || "none"}.`,
-      "info",
+  for (;;) {
+    const managerOptions: {
+      initialState?: ToolManagerState;
+      onApply: (
+        active: string[],
+      ) => Promise<{ ok: true } | { ok: false; error: string }>;
+    } = {
+      onApply: async (active) => {
+        try {
+          persistActiveTools(pi, active);
+          // Snapshot evidence may enable session-only mode immediately.
+          hooks.onRuntimeInvalidate?.();
+          return { ok: true };
+        } catch (error) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    };
+    if (initialState !== undefined) managerOptions.initialState = initialState;
+
+    const result: ToolManagerResult = await openToolManager(
+      ctx,
+      pi.getAllTools(),
+      pi.getActiveTools(),
+      managerOptions,
     );
-  } catch (error) {
-    ctx.ui.notify(
-      `Toolbelt tools not applied; active tools were unchanged because the session snapshot could not be persisted: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-      "error",
+
+    if (result.kind === "close") return;
+
+    const discard = await ctx.ui.confirm(
+      "Discard tool changes?",
+      "You have unapplied staged tool changes. Discard them and close?",
     );
+    if (discard) return;
+    initialState = result.state;
   }
 }
 
@@ -258,16 +209,8 @@ async function handleStatus(
   pi: ExtensionAPI,
   ctx: CommandContext,
 ): Promise<void> {
-  const effective = buildEffectiveConfig(ctx.cwd);
-
-  if (!isEnabled(effective) && !hasConfigError(effective)) {
-    ctx.ui.notify(
-      "Toolbelt: disabled — no config files found. Run /toolbelt setup to enable.",
-      "info",
-    );
-    return;
-  }
-
+  const runtime = loadRuntime(ctx);
+  const { effective } = runtime;
   const active = pi.getActiveTools();
   const registered = pi.getAllTools();
 
@@ -290,30 +233,58 @@ async function handleStatus(
   }
 
   const lines: string[] = [];
-  if (isEnabled(effective)) {
+
+  if (runtime.mode === "configured") {
     const configPaths: string[] = [];
-    if (effective.globalValid) configPaths.push(effective.globalPath);
-    if (effective.projectValid) configPaths.push(effective.projectPath);
+    if (effective.global.state === "valid")
+      configPaths.push(effective.globalPath);
+    if (effective.project.state === "valid")
+      configPaths.push(effective.projectPath);
 
     const searchDesc =
       effective.search.type === "llm"
         ? `LLM (model: ${effective.search.model ?? "inherit active"})`
         : "BM25 (local)";
 
-    lines.push("Toolbelt: enabled");
+    lines.push("Toolbelt: configured");
     lines.push(`Config: ${configPaths.join(", ")}`);
     lines.push(`Source: ${effective.source}`);
-    lines.push(`Baseline: ${effective.baseline.join(", ") || "(none)"}`);
-    lines.push(`Search: ${searchDesc} (source: ${effective.searchSource})`);
-  } else if (hasConfigError(effective)) {
-    lines.push("Toolbelt: disabled (config has errors)");
-    const errors: string[] = [];
-    if (effective.globalError) errors.push(effective.globalError);
-    if (effective.projectError) errors.push(effective.projectError);
-    if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
-  } else {
     lines.push(
-      "Toolbelt: disabled - no config files found. Run /toolbelt setup to enable changes.",
+      `Baseline: ${effective.baseline.join(", ") || "(none)"} (source: ${effective.baselineSource})`,
+    );
+    lines.push(`Search: ${searchDesc} (source: ${effective.searchSource})`);
+    if (runtime.hasSnapshot) {
+      lines.push("Session snapshot: present");
+    }
+  } else if (runtime.mode === "session-only") {
+    if (runtime.configInvalid) {
+      lines.push("Toolbelt: session-only (config invalid)");
+      const errors = configErrorMessages(effective);
+      if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
+      lines.push(
+        "Session tools remain available via the explicit active-tool snapshot.",
+      );
+    } else {
+      lines.push("Toolbelt: session-only");
+      lines.push("No usable config - discovery uses default BM25.");
+    }
+    lines.push("Search: BM25 (local) (source: session-only)");
+  } else {
+    if (hasConfigError(effective)) {
+      lines.push("Toolbelt: inactive (config invalid)");
+      const errors = configErrorMessages(effective);
+      if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
+    } else {
+      lines.push("Toolbelt: inactive");
+      lines.push(
+        "No config and no session snapshot. Use /toolbelt tools or /toolbelt settings.",
+      );
+    }
+  }
+
+  if (effective.project.state === "ignored") {
+    lines.push(
+      `Project config ignored until this project is trusted (${effective.projectPath}).`,
     );
   }
 
@@ -332,8 +303,8 @@ async function handleStatus(
         receipt.rankings.length > 0
           ? `  matches (${receipt.requestedBackend}): ${receipt.rankings
               .map(
-                ({ rank, name, description, active }) =>
-                  `${rank}. ${name} (${active ? "active" : "inactive"})${description ? ` - ${description}` : ""}`,
+                ({ rank, name, description, active: isActive }) =>
+                  `${rank}. ${name} (${isActive ? "active" : "inactive"})${description ? ` - ${description}` : ""}`,
               )
               .join(" | ")}`
           : "  no matching tools",
@@ -351,7 +322,6 @@ async function handleStatus(
           parts.push(`total: ${receipt.usage.totalTokens}`);
         if (parts.length > 0) lines.push(`  usage: ${parts.join(", ")}`);
       }
-      // Show preview of raw output (first 200 chars)
       const preview =
         receipt.raw.length > 200
           ? `${receipt.raw.slice(0, 200)}...`
@@ -369,8 +339,24 @@ async function handleReset(
   pi: ExtensionAPI,
   ctx: CommandContext,
 ): Promise<void> {
-  const effective = buildEffectiveConfig(ctx.cwd);
+  const runtime = loadRuntime(ctx);
+  const { effective } = runtime;
+
   if (!isEnabled(effective)) {
+    if (runtime.mode === "session-only") {
+      ctx.ui.notify(
+        "Toolbelt reset requires a configured baseline. Session-only mode has no baseline to restore.",
+        "warning",
+      );
+      return;
+    }
+    if (hasConfigError(effective)) {
+      ctx.ui.notify(
+        "Toolbelt reset is disabled while config has errors.",
+        "warning",
+      );
+      return;
+    }
     ctx.ui.notify(
       "Toolbelt: disabled (no valid config). Nothing to reset.",
       "warning",
@@ -378,10 +364,43 @@ async function handleReset(
     return;
   }
 
-  const requested = filterRegisteredTools(pi, effective.baseline);
+  const target = filterRegisteredTools(pi, effective.baseline);
+  const before = pi.getActiveTools();
+  const beforeSet = new Set(before);
+  const afterSet = new Set(target);
+  const added = target.filter((name) => !beforeSet.has(name));
+  const removed = before.filter((name) => !afterSet.has(name));
+
+  if (added.length === 0 && removed.length === 0) {
+    ctx.ui.notify(
+      `Toolbelt reset: nothing to change. Active: ${before.length} tools unchanged.`,
+      "info",
+    );
+    return;
+  }
+
+  const previewLines = [
+    "Reset active tools to the configured baseline?",
+    "",
+    added.length > 0 ? `Add: ${added.join(", ")}` : "Add: (none)",
+    removed.length > 0 ? `Remove: ${removed.join(", ")}` : "Remove: (none)",
+    `Final active count: ${target.length}`,
+    "",
+    `Baseline source: ${effective.baselineSource}`,
+  ];
+
+  const confirmed = await ctx.ui.confirm(
+    "Reset Toolbelt baseline?",
+    previewLines.join("\n"),
+  );
+  if (!confirmed) {
+    ctx.ui.notify("Toolbelt reset cancelled", "info");
+    return;
+  }
+
   let change: ReturnType<typeof persistActiveTools>;
   try {
-    change = persistActiveTools(pi, requested);
+    change = persistActiveTools(pi, target);
   } catch (error) {
     ctx.ui.notify(
       `Toolbelt reset aborted; active tools were not changed because the session snapshot could not be persisted: ${
@@ -392,21 +411,12 @@ async function handleReset(
     return;
   }
 
-  if (change.removed.length > 0 || change.added.length > 0) {
-    const lines = ["✓ Toolbelt reset"];
-    if (change.added.length > 0)
-      lines.push(`Added: ${change.added.join(", ")}`);
-    if (change.removed.length > 0)
-      lines.push(`Removed: ${change.removed.join(", ")}`);
-    lines.push(
-      `Active: ${change.after.length} tools (${change.after.join(", ") || "none"})`,
-    );
-    ctx.ui.notify(lines.join("\n"), "warning");
-  } else {
-    ctx.ui.notify(
-      `Toolbelt reset: nothing to change. ` +
-        `Active: ${change.after.length} tools unchanged.`,
-      "info",
-    );
-  }
+  const lines = ["Toolbelt reset complete"];
+  if (change.added.length > 0) lines.push(`Added: ${change.added.join(", ")}`);
+  if (change.removed.length > 0)
+    lines.push(`Removed: ${change.removed.join(", ")}`);
+  lines.push(
+    `Active: ${change.after.length} tools (${change.after.join(", ") || "none"})`,
+  );
+  ctx.ui.notify(lines.join("\n"), "warning");
 }

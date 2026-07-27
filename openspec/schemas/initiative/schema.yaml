@@ -1,0 +1,92 @@
+name: initiative
+version: 1
+description: Plan a large effort as a coherent set of independently mergeable OpenSpec changes
+artifacts:
+  - id: brief
+    generates: brief.md
+    description: Initiative intent, boundaries, constraints, and success conditions
+    template: brief.md
+    instruction: |
+      Establish WHY the initiative exists and define its outer boundary.
+
+      Describe the desired final state without prematurely decomposing implementation work.
+      Separate outcomes from implementation ideas. Record explicit non-goals, durable
+      constraints, and the conditions that would make the initiative complete.
+
+      The brief is complete when a fresh agent can distinguish the initiative's intended
+      outcome from adjacent work and identify every unresolved owner decision that could
+      materially change its scope.
+    requires: []
+
+  - id: research
+    generates: research.md
+    description: Evidence-based map of the current state, target constraints, and unknowns
+    template: research.md
+    instruction: |
+      Investigate the codebase, documentation, history, and relevant external constraints
+      needed to plan the initiative responsibly.
+
+      Ground every material finding in concrete paths, symbols, commands, or sources.
+      Distinguish verified facts from assumptions and unresolved questions. Map existing
+      modules, integration seams, migration constraints, and work already in progress.
+      Focus on evidence that changes decomposition or sequencing.
+
+      The research is complete when every scope, architecture, sequencing, and risk question
+      raised by the brief is either answered with evidence or recorded as an explicit unknown.
+    requires:
+      - brief
+
+  - id: architecture
+    generates: architecture.md
+    description: Target architecture and decisions shared by the initiative's child changes
+    template: architecture.md
+    instruction: |
+      Define the target shape and the decisions that every child change must share.
+
+      Explain the important interfaces, seams, invariants, migration strategy, compatibility
+      policy, and verification approach. Resolve cross-change decisions here rather than
+      repeating them in each child change. Include alternatives only when they clarify why
+      the selected direction is preferable.
+
+      The architecture is complete when child changes can be designed independently without
+      making conflicting decisions about shared interfaces, sequencing, or system invariants.
+    requires:
+      - brief
+      - research
+
+  - id: change-map
+    generates: change-map.md
+    description: Dependency-ordered map of independently mergeable child changes
+    template: change-map.md
+    instruction: |
+      Decompose the initiative into normal OpenSpec changes.
+
+      Each child change must deliver one observable, independently mergeable outcome and leave
+      the repository in a valid state. Prefer vertical outcomes over horizontal technical
+      layers. A foundational change is acceptable only when it unlocks named downstream
+      behavior and has its own concrete acceptance evidence.
+
+      For every child change, define its kebab-case name, outcome, dependencies, scope,
+      non-goals, acceptance evidence, likely code surfaces, parallel-safety notes, and intended
+      commit boundary. Split any child that cannot fit comfortably within one fresh agent's
+      working context. Identify shared files or contracts that require serialized integration.
+
+      Group ready changes into dependency waves. A wave means changes are eligible to start;
+      it does not require concurrent implementation. Record unresolved decisions that block a
+      child instead of hiding them inside implementation tasks.
+
+      The change map is complete when every initiative outcome lands in exactly one child
+      change, every dependency is represented, every child has a checkable finish line, and a
+      fresh agent can propose each child without rediscovering initiative-level decisions.
+    requires:
+      - brief
+      - research
+      - architecture
+
+apply:
+  requires:
+    - change-map
+  tracks: null
+  instruction: |
+    This is a planning-only initiative. Do not implement product code from this change.
+    Present the dependency map and ask which ready child change the user wants to propose next.

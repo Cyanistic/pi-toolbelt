@@ -1,17 +1,21 @@
 /**
  * Toolbelt config loading and validation.
  *
- * Follows rpiv-core/utils.ts:45-75 fail-soft pattern: missing file, invalid
- * JSON, or wrong shape all return ConfigSource (never throw). The session_start
- * handler is the sole consumer; its validate-then-activate-or-warn gate is the
- * only path to active-set mutation.
- *
- * Validation accepts partial configs: a project file that sets only
- * `search` is valid; missing fields are filled from defaults
- * at merge time.
+ * Fail-soft: missing file, invalid JSON, wrong shape, and untrusted Project
+ * all return tagged ConfigSource values (never throw). Project trust is
+ * applied before any Project parse or merge. Empty objects and unknown-only
+ * objects are valid configured scopes; known fields validate through TypeBox.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
@@ -20,6 +24,7 @@ import { SearchConfigSchema, ToolbeltConfigFileSchema } from "./schemas.js";
 import type {
   ConfigSource,
   EffectiveConfig,
+  RuntimeMode,
   SearchConfig,
   ToolbeltConfig,
 } from "./types.js";
@@ -46,21 +51,26 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function deepCloneObject(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
-// Reader (fail-soft — never throws)
+// Reader (fail-soft - never throws)
 // ---------------------------------------------------------------------------
 
 /**
  * Read, parse, and validate a single toolbelt config file.
- * Returns ConfigSource with either partial config or error — never throws.
+ * Returns a tagged ConfigSource - never throws.
  *
- * Validation is lenient: any subset of fields is accepted. Missing fields
- * are filled from defaults at merge time (buildEffectiveConfig). Each
- * present field is independently validated.
+ * A JSON object is valid even when known fields are absent (`{}`) or only
+ * unknown fields are present. Present known fields must pass TypeBox checks.
  */
 export function readToolbeltConfig(path: string): ConfigSource {
   if (!existsSync(path)) {
-    return { path, config: undefined };
+    return { state: "missing", path };
   }
 
   let parsed: unknown;
@@ -68,16 +78,16 @@ export function readToolbeltConfig(path: string): ConfigSource {
     parsed = JSON.parse(readFileSync(path, "utf-8"));
   } catch (e) {
     return {
+      state: "invalid",
       path,
-      config: undefined,
       error: `Invalid JSON in ${path}: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 
   if (!isPlainObject(parsed)) {
     return {
+      state: "invalid",
       path,
-      config: undefined,
       error: `${path} does not contain a JSON object`,
     };
   }
@@ -85,45 +95,59 @@ export function readToolbeltConfig(path: string): ConfigSource {
   return validateConfig(parsed, path);
 }
 
+/**
+ * Resolve the Project scope under the current trust boundary.
+ * Untrusted projects never parse or validate the file.
+ */
+export function readProjectConfigSource(
+  path: string,
+  projectTrusted: boolean,
+): ConfigSource {
+  if (!projectTrusted) {
+    return existsSync(path)
+      ? { state: "ignored", path }
+      : { state: "missing", path };
+  }
+  return readToolbeltConfig(path);
+}
+
 // ---------------------------------------------------------------------------
-// Validator (lenient — partial configs accepted)
+// Validator
 // ---------------------------------------------------------------------------
 
 const toolbeltConfigFileValidator = Compile(ToolbeltConfigFileSchema);
 const searchConfigValidator = Compile(SearchConfigSchema);
 
 /**
- * Map TypeBox validation errors onto the existing user-facing wording.
- * Field order in the schema matches the expected fields priority.
+ * Map TypeBox validation errors onto stable user-facing wording.
  */
 function mapToolbeltConfigError(
   errors: readonly { instancePath: string; message?: string }[],
+  path: string,
 ): string {
   const error = errors[0];
   if (error === undefined) {
-    return "toolbelt.json: must contain at least one recognized field (baseline, search)";
+    return `${path}: invalid toolbelt configuration`;
   }
 
   const { instancePath } = error;
 
   if (instancePath === "/baseline") {
-    return "toolbelt.json: 'baseline' must be an array of tool names";
+    return `${path}: 'baseline' must be an array of tool names`;
   }
   if (instancePath.startsWith("/baseline/")) {
-    return "toolbelt.json: 'baseline' entries must be strings";
+    return `${path}: 'baseline' entries must be strings`;
   }
   if (instancePath === "/search" || instancePath.startsWith("/search/")) {
-    return `toolbelt.json: 'search' must be { "type": "bm25" } or { "type": "llm" } with optional model`;
+    return `${path}: 'search' must be { "type": "bm25" } or { "type": "llm" } with optional model`;
   }
 
-  return "toolbelt.json: must contain at least one recognized field (baseline, search)";
+  return `${path}: invalid toolbelt configuration`;
 }
 
 /**
- * Validate present fields against the ToolbeltConfig schema.
- * Missing fields are fine — the merge layer fills from defaults.
- * At least one recognized field must be present.
- * Unknown fields are tolerated but not copied into the result.
+ * Validate present known fields. Missing known fields are fine.
+ * Unknown top-level keys are retained only on `raw`.
  */
 function validateConfig(
   raw: Record<string, unknown>,
@@ -131,156 +155,210 @@ function validateConfig(
 ): ConfigSource {
   if (!toolbeltConfigFileValidator.Check(raw)) {
     return {
+      state: "invalid",
       path,
-      config: undefined,
-      error: mapToolbeltConfigError(toolbeltConfigFileValidator.Errors(raw)),
+      error: mapToolbeltConfigError(
+        toolbeltConfigFileValidator.Errors(raw),
+        path,
+      ),
     };
   }
 
-  // Copy only recognized fields — unknown keys stay out of the validated config.
   const config: Partial<ToolbeltConfig> = {};
   if (raw.baseline !== undefined) {
-    config.baseline = raw.baseline;
+    config.baseline = raw.baseline as string[];
   }
   if (raw.search !== undefined) {
     if (!searchConfigValidator.Check(raw.search)) {
       return {
+        state: "invalid",
         path,
-        config: undefined,
-        error:
-          'toolbelt.json: \'search\' must be { "type": "bm25" } or { "type": "llm", "model"?: "provider/id" }',
+        error: `${path}: 'search' must be { "type": "bm25" } or { "type": "llm", "model"?: "provider/id" }`,
       };
     }
     config.search = raw.search as SearchConfig;
   }
 
-  if (config.baseline === undefined && config.search === undefined) {
-    return {
-      path,
-      config: undefined,
-      error:
-        "toolbelt.json: must contain at least one recognized field (baseline, search)",
-    };
-  }
-
-  return { path, config };
+  return {
+    state: "valid",
+    path,
+    config,
+    raw: deepCloneObject(raw),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Merge — project arrays replace, scalars override, search object replaces
+// Merge - project arrays replace, scalars override, search object replaces
 // ---------------------------------------------------------------------------
 
 /**
- * Build effective config by loading global first, then overlaying project.
- * Each source is independently validated. Project fields override global;
- * project arrays replace global arrays (not concatenate). Missing fields
- * in either source fall through to the DEFAULT_CONFIG.
+ * Build effective config by loading Global always and Project only when
+ * trusted. Project fields override Global; arrays and search objects replace
+ * as units. Missing known fields fall through to DEFAULT_CONFIG / BM25.
  *
- * The search object is atomic: a project search replaces the global search
- * as a unit. searchSource records where the effective search came from.
- *
- * Enabled only when at least one source is valid AND neither source has
- * an error (FRD FR#8: if either config is malformed -> disable).
+ * Any malformed participating scope disables config-driven behavior even if
+ * the other scope is valid. Ignored Project never participates and never
+ * disables a valid Global scope.
  */
-export function buildEffectiveConfig(cwd: string): EffectiveConfig {
+export function buildEffectiveConfig(
+  cwd: string,
+  projectTrusted: boolean,
+): EffectiveConfig {
   const globalPath = getGlobalConfigPath();
   const projectPath = getProjectConfigPath(cwd);
 
   const global = readToolbeltConfig(globalPath);
-  const project = readToolbeltConfig(projectPath);
+  const project = readProjectConfigSource(projectPath, projectTrusted);
 
-  const globalValid = global.config !== undefined && global.error === undefined;
-  const projectValid =
-    project.config !== undefined && project.error === undefined;
+  const globalValid = global.state === "valid" ? global : undefined;
+  const projectValid = project.state === "valid" ? project : undefined;
 
-  // Neither config exists or is valid
-  if (!globalValid && !projectValid) {
-    return {
-      baseline: [...DEFAULT_CONFIG.baseline],
-      search: { type: "bm25" },
-      source: "none",
-      searchSource: "default",
-      globalPath,
-      projectPath,
-      globalValid,
-      projectValid,
-      ...(global.error !== undefined ? { globalError: global.error } : {}),
-      ...(project.error !== undefined ? { projectError: project.error } : {}),
-    };
+  const participatingInvalid =
+    global.state === "invalid" || project.state === "invalid";
+  const configured =
+    !participatingInvalid &&
+    (globalValid !== undefined || projectValid !== undefined);
+
+  const baselineFromProject = projectValid?.config.baseline;
+  const baselineFromGlobal = globalValid?.config.baseline;
+  const searchFromProject = projectValid?.config.search;
+  const searchFromGlobal = globalValid?.config.search;
+
+  let baselineSource: EffectiveConfig["baselineSource"] = "default";
+  let baseline: string[];
+  if (baselineFromProject !== undefined) {
+    baseline = [...baselineFromProject];
+    baselineSource = "project";
+  } else if (baselineFromGlobal !== undefined) {
+    baseline = [...baselineFromGlobal];
+    baselineSource = "global";
+  } else {
+    baseline = [...DEFAULT_CONFIG.baseline];
   }
 
-  // Merge: DEFAULT -> global -> project (each layer fills gaps in the prior)
-  const base = global.config !== undefined ? global.config : {};
-
-  const merged: ToolbeltConfig = {
-    baseline: project.config?.baseline ??
-      base.baseline ?? [...DEFAULT_CONFIG.baseline],
-    search: project.config?.search ?? base.search ?? { type: "bm25" },
-  };
-
-  const source = projectValid ? (globalValid ? "both" : "project") : "global";
-
-  // Determine search source
   let searchSource: EffectiveConfig["searchSource"] = "default";
-  if (project.config?.search !== undefined) {
+  let search: SearchConfig;
+  if (searchFromProject !== undefined) {
+    search = searchFromProject;
     searchSource = "project";
-  } else if (base.search !== undefined) {
+  } else if (searchFromGlobal !== undefined) {
+    search = searchFromGlobal;
     searchSource = "global";
+  } else {
+    search = { type: "bm25" };
   }
+
+  let source: EffectiveConfig["source"] = "none";
+  if (globalValid && projectValid) source = "both";
+  else if (projectValid) source = "project";
+  else if (globalValid) source = "global";
 
   return {
-    ...merged,
+    baseline,
+    search,
     source,
     searchSource,
+    baselineSource,
     globalPath,
     projectPath,
-    globalValid,
-    projectValid,
-    ...(global.error !== undefined ? { globalError: global.error } : {}),
-    ...(project.error !== undefined ? { projectError: project.error } : {}),
+    global,
+    project,
+    configured,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Writer
+// Runtime mode
 // ---------------------------------------------------------------------------
 
 /**
- * Write a toolbelt config file, creating parent directories as needed.
- * Throws on filesystem errors (handled by caller's try/catch).
+ * Resolve configured / session-only / inactive behavior from effective config
+ * plus whether the session branch already holds an explicit snapshot.
+ * Does not mutate tools.
  */
-export function writeToolbeltConfig(
-  path: string,
-  config: ToolbeltConfig,
-): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+export function resolveRuntimeMode(
+  effective: EffectiveConfig,
+  hasSnapshot: boolean,
+): RuntimeMode {
+  if (effective.configured) {
+    return { mode: "configured", effective, hasSnapshot };
+  }
+  if (hasSnapshot) {
+    return {
+      mode: "session-only",
+      effective,
+      hasSnapshot: true,
+      configInvalid:
+        effective.global.state === "invalid" ||
+        effective.project.state === "invalid",
+    };
+  }
+  return { mode: "inactive", effective, hasSnapshot: false };
 }
 
-// ---------------------------------------------------------------------------
-// Enabled / error checks
-// ---------------------------------------------------------------------------
-
-/**
- * True when at least one config source exists and is valid AND
- * neither source has an error (FRD FR#8: malformed config -> disable).
- */
+/** True when config-driven baseline, search, and reset are available. */
 export function isEnabled(effective: EffectiveConfig): boolean {
-  if (
-    effective.globalError !== undefined ||
-    effective.projectError !== undefined
-  )
-    return false;
-  return effective.source !== "none";
+  return effective.configured;
 }
 
-/**
- * True when any config file exists but failed validation.
- * Independent of isEnabled — a broken project file with a valid
- * global config should still warn.
- */
+/** True when a participating scope failed validation. */
 export function hasConfigError(effective: EffectiveConfig): boolean {
   return (
-    effective.globalError !== undefined || effective.projectError !== undefined
+    effective.global.state === "invalid" ||
+    effective.project.state === "invalid"
   );
+}
+
+/** Collect user-facing errors from participating invalid scopes. */
+export function configErrorMessages(effective: EffectiveConfig): string[] {
+  const messages: string[] = [];
+  if (effective.global.state === "invalid") {
+    messages.push(effective.global.error);
+  }
+  if (effective.project.state === "invalid") {
+    messages.push(effective.project.error);
+  }
+  return messages;
+}
+
+// ---------------------------------------------------------------------------
+// Writer - atomic per-scope replacement
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a complete raw JSON object via temp file + same-directory rename.
+ * Creates parent directories as needed. Cleans up the temporary file on
+ * handled failures when possible. Throws on filesystem errors.
+ */
+export function writeConfigRaw(
+  path: string,
+  raw: Record<string, unknown>,
+): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const directory = dirname(path);
+  const tempPath = join(
+    directory,
+    `.${CONFIG_FILE_NAME}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
+  );
+  const body = `${JSON.stringify(raw, null, 2)}\n`;
+  try {
+    writeFileSync(tempPath, body, "utf-8");
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only.
+    }
+    throw error;
+  }
+}
+
+/**
+ * Delete a scope config file. Missing files are a no-op success.
+ * Throws on other filesystem errors.
+ */
+export function deleteConfigFile(path: string): void {
+  if (!existsSync(path)) return;
+  unlinkSync(path);
 }

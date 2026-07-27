@@ -65,16 +65,15 @@ export function persistActiveTools(
   };
 }
 
-// ── Snapshot restoration ─────────────────────────────────────────
+// ── Snapshot presence / restoration ──────────────────────────────
 
 /**
- * Return the newest valid snapshot from the session branch, filtering
- * unregistered names. Returns undefined when no valid snapshot exists.
+ * Return the newest TypeBox-valid active-tool snapshot on the session
+ * branch without filtering or mutating tools. Undefined when none exists.
  */
-export function restoreActiveToolSnapshot(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-): string[] | undefined {
+export function findActiveToolSnapshot(
+  ctx: Pick<ExtensionContext, "sessionManager">,
+): ActiveToolSnapshot | undefined {
   const branch = ctx.sessionManager.getBranch();
 
   for (let i = branch.length - 1; i >= 0; i--) {
@@ -88,10 +87,30 @@ export function restoreActiveToolSnapshot(
     ) {
       continue;
     }
-    return filterRegisteredTools(pi, entry.data.active);
+    return entry.data;
   }
 
   return undefined;
+}
+
+/** True when the session branch holds at least one valid snapshot. */
+export function hasActiveToolSnapshot(
+  ctx: Pick<ExtensionContext, "sessionManager">,
+): boolean {
+  return findActiveToolSnapshot(ctx) !== undefined;
+}
+
+/**
+ * Return the newest valid snapshot from the session branch, filtering
+ * unregistered names. Returns undefined when no valid snapshot exists.
+ */
+export function restoreActiveToolSnapshot(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): string[] | undefined {
+  const snapshot = findActiveToolSnapshot(ctx);
+  if (snapshot === undefined) return undefined;
+  return filterRegisteredTools(pi, snapshot.active);
 }
 
 // ── Type guards ──────────────────────────────────────────────────

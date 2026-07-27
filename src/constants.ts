@@ -27,7 +27,7 @@ export const BACKEND_ID_BM25 = "bm25";
 /** Advisory LLM backend identifier embedded in search receipts. */
 export const BACKEND_ID_LLM = "llm";
 
-/** Default config seeded by /toolbelt setup. */
+/** Built-in default baseline when no scope overrides baseline. */
 export const DEFAULT_CONFIG = {
   baseline: ["read", "bash", "edit", "write", "query_tools", "manage_tools"],
   // search defaults are applied at merge time: { type: "bm25" }
