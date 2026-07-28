@@ -41,9 +41,18 @@ export type SearchConfig = Static<typeof SearchConfigSchema>;
 // Config
 // ---------------------------------------------------------------------------
 
+/**
+ * Scope baseline: JSON null = unrestricted; string[] (including empty) =
+ * exact allowlist. Omitted inherits parent / root unrestricted default.
+ */
+export const BaselineConfigSchema = Type.Union([
+  Type.Null(),
+  Type.Array(Type.String()),
+]);
+
 /** Full validated toolbelt.json shape after defaults are applied. */
 export const ToolbeltConfigSchema = Type.Object({
-  baseline: Type.Array(Type.String()),
+  baseline: BaselineConfigSchema,
   search: SearchConfigSchema,
 });
 
@@ -53,12 +62,13 @@ export const ToolbeltConfigSchema = Type.Object({
  */
 export const ToolbeltConfigFileSchema = Type.Object(
   {
-    baseline: Type.Optional(Type.Array(Type.String())),
+    baseline: Type.Optional(BaselineConfigSchema),
     search: Type.Optional(SearchConfigSchema),
   },
   { additionalProperties: true },
 );
 
+export type BaselineConfig = Static<typeof BaselineConfigSchema>;
 export type ToolbeltConfig = Static<typeof ToolbeltConfigSchema>;
 export type ToolbeltConfigFile = Static<typeof ToolbeltConfigFileSchema>;
 

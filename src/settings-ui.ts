@@ -22,8 +22,12 @@ import {
   deleteConfigFile,
   writeConfigRaw,
 } from "./config.js";
-import { DEFAULT_CONFIG } from "./constants.js";
-import type { ConfigSource, EffectiveConfig, SearchConfig } from "./types.js";
+import type {
+  ConfigSource,
+  EffectiveConfig,
+  ResolvedBaseline,
+  SearchConfig,
+} from "./types.js";
 import { FuzzyMultiSelector } from "./ui/fuzzy-multi-selector.js";
 import {
   flattenSettingsRows,
@@ -130,11 +134,17 @@ function clearMutation(source: ConfigSource): ScopeEditorState {
   return { source, mutation: { kind: "unchanged" } };
 }
 
+/**
+ * Present baseline on a draft: undefined = omitted/inherit;
+ * null = explicit unrestricted; string[] = custom list (may be empty).
+ */
 function knownBaseline(
   raw: Record<string, unknown> | undefined,
-): string[] | undefined {
+): string[] | null | undefined {
   if (raw === undefined) return undefined;
+  if (!Object.hasOwn(raw, "baseline")) return undefined;
   const value = raw["baseline"];
+  if (value === null) return null;
   if (!Array.isArray(value)) return undefined;
   if (!value.every((entry) => typeof entry === "string")) return undefined;
   return value as string[];
@@ -155,12 +165,19 @@ function knownSearch(
   return undefined;
 }
 
+/**
+ * Write baseline onto raw draft.
+ * undefined → omit key (Default/Inherit);
+ * null → explicit unrestricted;
+ * string[] → custom list (including empty).
+ */
 function setBaselineOnRaw(
   raw: Record<string, unknown>,
-  baseline: string[] | undefined,
+  baseline: string[] | null | undefined,
 ): Record<string, unknown> {
   const next = deepCloneRaw(raw);
   if (baseline === undefined) delete next["baseline"];
+  else if (baseline === null) next["baseline"] = null;
   else next["baseline"] = [...baseline];
   return next;
 }
@@ -193,10 +210,15 @@ function setSearchOnRaw(
   return next;
 }
 
-function formatBaseline(tools: readonly string[]): string {
+function formatBaselineList(tools: readonly string[]): string {
   if (tools.length === 0) return "(none)";
   if (tools.length <= 4) return tools.join(", ");
   return `${tools.slice(0, 3).join(", ")} +${tools.length - 3}`;
+}
+
+function formatResolvedBaseline(baseline: ResolvedBaseline): string {
+  if (baseline.kind === "unrestricted") return "unrestricted";
+  return formatBaselineList(baseline.tools);
 }
 
 function formatSearch(s: SearchConfig): string {
@@ -216,13 +238,20 @@ function sourceLabel(
 // Resolve effective values from drafts (for display)
 // ---------------------------------------------------------------------------
 
+function resolveBaselineFromKnown(
+  value: string[] | null,
+  source: "global" | "project",
+): ResolvedBaseline {
+  if (value === null) return { kind: "unrestricted", source };
+  return { kind: "list", tools: [...value], source };
+}
+
 function resolveFromDrafts(
   global: ScopeEditorState,
   project: ScopeEditorState,
   projectTrusted: boolean,
 ): {
-  baseline: string[];
-  baselineSource: "default" | "global" | "project";
+  baseline: ResolvedBaseline;
   search: SearchConfig;
   searchSource: "default" | "global" | "project";
 } {
@@ -234,16 +263,13 @@ function resolveFromDrafts(
 
   const pBase = knownBaseline(pRaw);
   const gBase = knownBaseline(gRaw);
-  let baseline: string[];
-  let baselineSource: "default" | "global" | "project" = "default";
+  let baseline: ResolvedBaseline;
   if (pBase !== undefined) {
-    baseline = [...pBase];
-    baselineSource = "project";
+    baseline = resolveBaselineFromKnown(pBase, "project");
   } else if (gBase !== undefined) {
-    baseline = [...gBase];
-    baselineSource = "global";
+    baseline = resolveBaselineFromKnown(gBase, "global");
   } else {
-    baseline = [...DEFAULT_CONFIG.baseline];
+    baseline = { kind: "unrestricted", source: "default" };
   }
 
   const pSearch = knownSearch(pRaw);
@@ -260,7 +286,7 @@ function resolveFromDrafts(
     search = { type: "bm25" };
   }
 
-  return { baseline, baselineSource, search, searchSource };
+  return { baseline, search, searchSource };
 }
 
 // ---------------------------------------------------------------------------
@@ -717,15 +743,20 @@ class SettingsUiComponent implements Component {
     const options: SingleSelectOption[] =
       scope === "global"
         ? [
-            { id: "default", label: "Default - use built-in baseline" },
+            { id: "default", label: "Default - unrestricted (omit)" },
+            { id: "unrestricted", label: "Unrestricted - write null" },
             { id: "custom", label: "Custom - choose tools" },
           ]
         : [
             { id: "inherit", label: "Inherit - use Global or Default" },
+            { id: "unrestricted", label: "Unrestricted - write null" },
             { id: "custom", label: "Custom - choose tools" },
           ];
     const own = knownBaseline(draftRaw(activeScope(this.state)));
-    const selected = own === undefined ? 0 : 1;
+    let selected = 0;
+    if (own === undefined) selected = 0;
+    else if (own === null) selected = 1;
+    else selected = 2;
     this.state.view = {
       kind: "baseline-mode",
       selector: new SingleSelector(
@@ -748,7 +779,14 @@ class SettingsUiComponent implements Component {
       this.state.project,
       this.state.projectTrusted,
     );
-    const selected = new Set(own ?? resolved.baseline);
+    // Seed custom editor from own list, else resolved list, else empty.
+    const seed: string[] =
+      own !== undefined && own !== null
+        ? own
+        : resolved.baseline.kind === "list"
+          ? resolved.baseline.tools
+          : [];
+    const selected = new Set(seed);
     const registered = new Map(
       this.tools.map((t) => [t.name, t.description ?? ""] as const),
     );
@@ -869,10 +907,22 @@ class SettingsUiComponent implements Component {
       this.openBaselineEditor();
       return;
     }
-    // default / inherit: remove baseline key
     const scope = activeScope(this.state);
     const raw = draftRaw(scope);
     if (raw === undefined) return;
+
+    if (id === "unrestricted") {
+      const next = setBaselineOnRaw(raw, null);
+      this.state = withActiveScope(this.state, stageWrite(scope, next));
+      this.state.view = { kind: "main" };
+      this.state.status =
+        this.state.scope === "global"
+          ? "Global baseline set to Unrestricted (null)."
+          : "Project baseline set to Unrestricted (null).";
+      return;
+    }
+
+    // default / inherit: remove baseline key
     const next = setBaselineOnRaw(raw, undefined);
     this.state = withActiveScope(this.state, stageWrite(scope, next));
     this.state.view = { kind: "main" };
@@ -1129,19 +1179,20 @@ class SettingsUiComponent implements Component {
     const ownBase = knownBaseline(raw);
     const ownSearch = knownSearch(raw);
 
-    // Baseline display
+    // Baseline display — unrestricted shown distinctly from list membership.
     let baselineValue: string;
     let baselineSource: ValueSourceLabel;
     let baselineNote: string | undefined;
     if (ownBase !== undefined) {
-      baselineValue = formatBaseline(ownBase);
+      baselineValue =
+        ownBase === null ? "unrestricted" : formatBaselineList(ownBase);
       baselineSource = scopeId === "global" ? "Global" : "Project";
     } else {
-      baselineValue = formatBaseline(resolved.baseline);
+      baselineValue = formatResolvedBaseline(resolved.baseline);
       if (scopeId === "global") {
         baselineSource = "Default";
         baselineNote = "(inherited from Default)";
-      } else if (resolved.baselineSource === "global") {
+      } else if (resolved.baseline.source === "global") {
         baselineSource = "Global";
         baselineNote = "(inherited from Global)";
       } else {

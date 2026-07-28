@@ -4,6 +4,7 @@
 export type {
   ActiveToolSnapshot,
   AdvisoryReceipt,
+  BaselineConfig,
   DiscoveryReceipt,
   ManageToolsParams,
   ModelUsage,
@@ -20,6 +21,21 @@ import type {
   ToolbeltConfig,
   ToolManagementAction,
 } from "./schemas.js";
+
+// ---------------------------------------------------------------------------
+// Resolved baseline (effective config)
+// ---------------------------------------------------------------------------
+
+/** Which scope (or root default) contributed the effective baseline. */
+export type BaselineSource = "default" | "global" | "project";
+
+/**
+ * Effective baseline as a tagged union so unrestricted cannot be confused
+ * with an empty allowlist.
+ */
+export type ResolvedBaseline =
+  | { kind: "unrestricted"; source: BaselineSource }
+  | { kind: "list"; tools: string[]; source: BaselineSource };
 
 // ---------------------------------------------------------------------------
 // Config sources (tagged states)
@@ -68,20 +84,20 @@ export type ConfigSource =
 
 /** Resolved configuration combining trusted global + project sources. */
 export interface EffectiveConfig {
-  baseline: string[];
+  /** Effective baseline: unrestricted or exact allowlist, with source. */
+  baseline: ResolvedBaseline;
   search: SearchConfig;
   /** Which scopes contributed known config (valid only). */
   source: "global" | "project" | "both" | "none";
   searchSource: "default" | "global" | "project";
-  baselineSource: "default" | "global" | "project";
   globalPath: string;
   projectPath: string;
   global: ConfigSource;
   project: ConfigSource;
   /**
-   * True when config-driven behavior is available: at least one
-   * participating scope is valid and no participating scope is invalid.
-   * Ignored Project never participates.
+   * True when no participating scope is invalid — including when both
+   * scopes are missing (default configuration). Ignored Project never
+   * participates. Malformed participating scopes disable config-driven mode.
    */
   configured: boolean;
 }

@@ -71,11 +71,11 @@ const COMPS: Record<string, CompletionNode> = {
   settings: { description: "Edit persistent configuration" },
   tools: { description: "Inspect and change active session tools" },
   status: { description: "Show current toolbelt state" },
-  reset: { description: "Restore configured baseline" },
+  reset: { description: "Restore baseline or activate all registered tools" },
 };
 
 const INACTIVE_GUIDANCE =
-  "Toolbelt is inactive. Use /toolbelt tools to establish a session tool set, or /toolbelt settings to create configuration.";
+  "Toolbelt config is unusable and no session tool snapshot exists. Fix configuration with /toolbelt settings, or establish a session tool set with /toolbelt tools.";
 
 export default function (pi: ExtensionAPI) {
   let searchEngine: SearchEngine | null = null;
@@ -617,27 +617,34 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // No snapshot: apply baseline only from valid effective config.
-    if (effective.configured) {
-      const active = filterRegisteredTools(pi, effective.baseline);
+    // No snapshot: apply list baseline only; unrestricted leaves host set alone.
+    if (effective.configured && effective.baseline.kind === "list") {
+      const active = filterRegisteredTools(pi, effective.baseline.tools);
       pi.setActiveTools(active);
       currentRuntime = resolveRuntimeMode(effective, false);
       if (debug) {
         ctx.ui.notify(
-          `[toolbelt] configured baseline active: ${active.join(", ")} (source: ${effective.source})`,
+          `[toolbelt] list baseline applied: ${active.join(", ") || "(none)"} (source: ${effective.baseline.source})`,
           "info",
         );
       }
       return;
     }
 
-    // Inactive: no mutation.
+    // Configured unrestricted (or config unusable without snapshot): no mutation.
     currentRuntime = resolveRuntimeMode(effective, false);
     if (debug) {
-      ctx.ui.notify(
-        "[toolbelt] inactive - no valid config and no session snapshot",
-        "info",
-      );
+      if (effective.configured) {
+        ctx.ui.notify(
+          `[toolbelt] unrestricted baseline - host active set left unchanged (source: ${effective.baseline.source})`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify(
+          "[toolbelt] config unusable and no session snapshot - tools not mutated",
+          "info",
+        );
+      }
     }
   });
 }

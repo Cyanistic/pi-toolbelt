@@ -19,11 +19,13 @@ import {
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
-import { CONFIG_FILE_NAME, DEFAULT_CONFIG } from "./constants.js";
+import { CONFIG_FILE_NAME } from "./constants.js";
 import { SearchConfigSchema, ToolbeltConfigFileSchema } from "./schemas.js";
 import type {
+  BaselineConfig,
   ConfigSource,
   EffectiveConfig,
+  ResolvedBaseline,
   RuntimeMode,
   SearchConfig,
   ToolbeltConfig,
@@ -133,7 +135,7 @@ function mapToolbeltConfigError(
   const { instancePath } = error;
 
   if (instancePath === "/baseline") {
-    return `${path}: 'baseline' must be an array of tool names`;
+    return `${path}: 'baseline' must be null or an array of tool names`;
   }
   if (instancePath.startsWith("/baseline/")) {
     return `${path}: 'baseline' entries must be strings`;
@@ -166,7 +168,8 @@ function validateConfig(
 
   const config: Partial<ToolbeltConfig> = {};
   if (raw.baseline !== undefined) {
-    config.baseline = raw.baseline as string[];
+    // Present null or string[] — both are valid BaselineConfig values.
+    config.baseline = raw.baseline as BaselineConfig;
   }
   if (raw.search !== undefined) {
     if (!searchConfigValidator.Check(raw.search)) {
@@ -192,13 +195,29 @@ function validateConfig(
 // ---------------------------------------------------------------------------
 
 /**
+ * Map a present scope baseline (null | string[]) onto ResolvedBaseline.
+ * Callers must only pass defined values; omit is handled by inheritance.
+ */
+function resolveBaselineValue(
+  value: BaselineConfig,
+  source: "global" | "project",
+): ResolvedBaseline {
+  if (value === null) {
+    return { kind: "unrestricted", source };
+  }
+  return { kind: "list", tools: [...value], source };
+}
+
+/**
  * Build effective config by loading Global always and Project only when
  * trusted. Project fields override Global; arrays and search objects replace
- * as units. Missing known fields fall through to DEFAULT_CONFIG / BM25.
+ * as units. Missing known fields fall through to root defaults (unrestricted
+ * baseline, BM25 search).
  *
  * Any malformed participating scope disables config-driven behavior even if
- * the other scope is valid. Ignored Project never participates and never
- * disables a valid Global scope.
+ * the other scope is valid. Missing files are not a disabled state —
+ * configured is true whenever no participating scope is invalid. Ignored
+ * Project never participates and never disables a valid Global scope.
  */
 export function buildEffectiveConfig(
   cwd: string,
@@ -215,25 +234,21 @@ export function buildEffectiveConfig(
 
   const participatingInvalid =
     global.state === "invalid" || project.state === "invalid";
-  const configured =
-    !participatingInvalid &&
-    (globalValid !== undefined || projectValid !== undefined);
+  // Missing files are valid default configuration (unrestricted + BM25).
+  const configured = !participatingInvalid;
 
   const baselineFromProject = projectValid?.config.baseline;
   const baselineFromGlobal = globalValid?.config.baseline;
   const searchFromProject = projectValid?.config.search;
   const searchFromGlobal = globalValid?.config.search;
 
-  let baselineSource: EffectiveConfig["baselineSource"] = "default";
-  let baseline: string[];
+  let baseline: ResolvedBaseline;
   if (baselineFromProject !== undefined) {
-    baseline = [...baselineFromProject];
-    baselineSource = "project";
+    baseline = resolveBaselineValue(baselineFromProject, "project");
   } else if (baselineFromGlobal !== undefined) {
-    baseline = [...baselineFromGlobal];
-    baselineSource = "global";
+    baseline = resolveBaselineValue(baselineFromGlobal, "global");
   } else {
-    baseline = [...DEFAULT_CONFIG.baseline];
+    baseline = { kind: "unrestricted", source: "default" };
   }
 
   let searchSource: EffectiveConfig["searchSource"] = "default";
@@ -258,7 +273,6 @@ export function buildEffectiveConfig(
     search,
     source,
     searchSource,
-    baselineSource,
     globalPath,
     projectPath,
     global,
@@ -275,6 +289,10 @@ export function buildEffectiveConfig(
  * Resolve configured / session-only / inactive behavior from effective config
  * plus whether the session branch already holds an explicit snapshot.
  * Does not mutate tools.
+ *
+ * Missing files resolve to configured defaults. Session-only is reserved for
+ * malformed participating config with a valid snapshot. Inactive remains only
+ * when config is unusable and no snapshot exists.
  */
 export function resolveRuntimeMode(
   effective: EffectiveConfig,

@@ -78,7 +78,7 @@ export async function handleToolbeltCommand(
           "  /toolbelt settings  - edit persistent configuration\n" +
           "  /toolbelt tools     - inspect and change session tools\n" +
           "  /toolbelt status    - show current state\n" +
-          "  /toolbelt reset     - restore configured baseline",
+          "  /toolbelt reset     - restore baseline (list) or activate all registered tools (unrestricted)",
         "info",
       );
       break;
@@ -246,40 +246,43 @@ async function handleStatus(
         ? `LLM (model: ${effective.search.model ?? "inherit active"})`
         : "BM25 (local)";
 
+    const baselineDesc =
+      effective.baseline.kind === "unrestricted"
+        ? "unrestricted"
+        : effective.baseline.tools.join(", ") || "(none)";
+
     lines.push("Toolbelt: configured");
-    lines.push(`Config: ${configPaths.join(", ")}`);
-    lines.push(`Source: ${effective.source}`);
+    if (configPaths.length > 0) {
+      lines.push(`Config: ${configPaths.join(", ")}`);
+      lines.push(`Source: ${effective.source}`);
+    } else {
+      lines.push("Config: (none - using defaults)");
+      lines.push("Source: none");
+    }
     lines.push(
-      `Baseline: ${effective.baseline.join(", ") || "(none)"} (source: ${effective.baselineSource})`,
+      `Baseline: ${baselineDesc} (source: ${effective.baseline.source})`,
     );
     lines.push(`Search: ${searchDesc} (source: ${effective.searchSource})`);
     if (runtime.hasSnapshot) {
       lines.push("Session snapshot: present");
     }
   } else if (runtime.mode === "session-only") {
-    if (runtime.configInvalid) {
-      lines.push("Toolbelt: session-only (config invalid)");
-      const errors = configErrorMessages(effective);
-      if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
-      lines.push(
-        "Session tools remain available via the explicit active-tool snapshot.",
-      );
-    } else {
-      lines.push("Toolbelt: session-only");
-      lines.push("No usable config - discovery uses default BM25.");
-    }
+    // Session-only only when config is unusable but a snapshot exists.
+    lines.push("Toolbelt: session-only (config invalid)");
+    const errors = configErrorMessages(effective);
+    if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
+    lines.push(
+      "Session tools remain available via the explicit active-tool snapshot.",
+    );
     lines.push("Search: BM25 (local) (source: session-only)");
   } else {
-    if (hasConfigError(effective)) {
-      lines.push("Toolbelt: inactive (config invalid)");
-      const errors = configErrorMessages(effective);
-      if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
-    } else {
-      lines.push("Toolbelt: inactive");
-      lines.push(
-        "No config and no session snapshot. Use /toolbelt tools or /toolbelt settings.",
-      );
-    }
+    // Inactive: config unusable and no snapshot.
+    lines.push("Toolbelt: inactive (config invalid)");
+    const errors = configErrorMessages(effective);
+    if (errors.length > 0) lines.push(`Errors: ${errors.join("; ")}`);
+    lines.push(
+      "Config-driven behavior unavailable. Fix config with /toolbelt settings, or establish a session tool set with /toolbelt tools.",
+    );
   }
 
   if (effective.project.state === "ignored") {
@@ -345,7 +348,7 @@ async function handleReset(
   if (!isEnabled(effective)) {
     if (runtime.mode === "session-only") {
       ctx.ui.notify(
-        "Toolbelt reset requires a configured baseline. Session-only mode has no baseline to restore.",
+        "Toolbelt reset requires usable config. Session-only mode has no baseline to restore.",
         "warning",
       );
       return;
@@ -358,13 +361,17 @@ async function handleReset(
       return;
     }
     ctx.ui.notify(
-      "Toolbelt: disabled (no valid config). Nothing to reset.",
+      "Toolbelt reset is disabled: config-driven behavior unavailable.",
       "warning",
     );
     return;
   }
 
-  const target = filterRegisteredTools(pi, effective.baseline);
+  // List baseline → filtered allowlist; unrestricted → all currently registered.
+  const target =
+    effective.baseline.kind === "list"
+      ? filterRegisteredTools(pi, effective.baseline.tools)
+      : pi.getAllTools().map((tool) => tool.name);
   const before = pi.getActiveTools();
   const beforeSet = new Set(before);
   const afterSet = new Set(target);
@@ -379,14 +386,18 @@ async function handleReset(
     return;
   }
 
+  const targetLabel =
+    effective.baseline.kind === "list"
+      ? "configured list baseline"
+      : "all currently registered tools (unrestricted baseline)";
   const previewLines = [
-    "Reset active tools to the configured baseline?",
+    `Reset active tools to ${targetLabel}?`,
     "",
     added.length > 0 ? `Add: ${added.join(", ")}` : "Add: (none)",
     removed.length > 0 ? `Remove: ${removed.join(", ")}` : "Remove: (none)",
     `Final active count: ${target.length}`,
     "",
-    `Baseline source: ${effective.baselineSource}`,
+    `Baseline: ${effective.baseline.kind} (source: ${effective.baseline.source})`,
   ];
 
   const confirmed = await ctx.ui.confirm(

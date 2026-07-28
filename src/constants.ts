@@ -27,11 +27,14 @@ export const BACKEND_ID_BM25 = "bm25";
 /** Advisory LLM backend identifier embedded in search receipts. */
 export const BACKEND_ID_LLM = "llm";
 
-/** Built-in default baseline when no scope overrides baseline. */
+/**
+ * Root defaults when no scope supplies a value.
+ * Baseline defaults to unrestricted (omit through the full inherit chain);
+ * search defaults to BM25 at merge time.
+ */
 export const DEFAULT_CONFIG = {
-  baseline: ["read", "bash", "edit", "write", "query_tools", "manage_tools"],
   // search defaults are applied at merge time: { type: "bm25" }
-};
+} as const;
 
 /** Default limit for query_tools results when caller omits limit. */
 export const DEFAULT_LIMIT = 5;
