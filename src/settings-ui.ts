@@ -1,10 +1,11 @@
 /**
  * Production Toolbelt Settings editor.
  *
- * Non-overlay custom view for Global/Project configuration. Drafts are
- * tagged per-scope mutations (unchanged / write / remove). Save never
- * mutates session tools. Interaction patterns from the validated settings
- * prototype and @aliou/pi-utils-settings 0.17.0 chrome.
+ * Non-overlay custom view for Global/Project configuration. Configuration
+ * meaning lives in `config.ts`; this module owns labels, pickers, navigation,
+ * cursor, footer/status, and discard flow. Save never mutates session tools.
+ * Interaction patterns from the validated settings prototype and
+ * @aliou/pi-utils-settings 0.17.0 chrome.
  */
 
 import type {
@@ -18,16 +19,20 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
-  buildEffectiveConfig,
-  deleteConfigFile,
-  writeConfigRaw,
+  type BaselineSelection,
+  type ConfigEdit,
+  type ConfigEditorSession,
+  type ConfigEditorSnapshot,
+  type ConfigEditResult,
+  type ConfigSaveResult,
+  type ConfigScopeId,
+  type ConfigScopeSnapshot,
+  createConfigEditorSession,
+  type LocalConfig,
+  type ScopeSaveOutcome,
+  type SearchSelection,
 } from "./config.js";
-import type {
-  ConfigSource,
-  EffectiveConfig,
-  ResolvedBaseline,
-  SearchConfig,
-} from "./types.js";
+import type { ResolvedBaseline, SearchConfig } from "./types.js";
 import { FuzzyMultiSelector } from "./ui/fuzzy-multi-selector.js";
 import {
   flattenSettingsRows,
@@ -46,17 +51,7 @@ import { ToolbeltFrame } from "./ui/toolbelt-frame.js";
 // Public types
 // ---------------------------------------------------------------------------
 
-export type ScopeId = "global" | "project";
-
-export type ScopeMutation =
-  | { kind: "unchanged" }
-  | { kind: "write"; raw: Record<string, unknown> }
-  | { kind: "remove" };
-
-export interface ScopeEditorState {
-  source: ConfigSource;
-  mutation: ScopeMutation;
-}
+export type ScopeId = ConfigScopeId;
 
 export type SettingsView =
   | { kind: "main" }
@@ -69,15 +64,17 @@ export type SettingsView =
       origin: "backend" | "model-row";
     };
 
+/**
+ * UI-owned editor state. Configuration drafts live inside `session`;
+ * this object retains scope selection, cursor, status, nested picker view,
+ * and the session itself across discard confirmation.
+ */
 export interface SettingsEditorState {
   scope: ScopeId;
   selected: number;
   status: string;
-  global: ScopeEditorState;
-  project: ScopeEditorState;
   view: SettingsView;
-  projectTrusted: boolean;
-  cwd: string;
+  session: ConfigEditorSession;
 }
 
 export type SettingsUiResult =
@@ -85,130 +82,8 @@ export type SettingsUiResult =
   | { kind: "discard-request"; editor: SettingsEditorState };
 
 // ---------------------------------------------------------------------------
-// Draft helpers
+// Display helpers (labels / formatting only)
 // ---------------------------------------------------------------------------
-
-function deepCloneRaw(value: Record<string, unknown>): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isDirty(scope: ScopeEditorState): boolean {
-  return scope.mutation.kind !== "unchanged";
-}
-
-function isWritable(
-  scope: ScopeEditorState,
-  scopeId: ScopeId,
-  projectTrusted: boolean,
-): boolean {
-  if (scopeId === "project" && !projectTrusted) return false;
-  return scope.source.state === "missing" || scope.source.state === "valid";
-}
-
-/** Current draft raw for a writable scope, or undefined when removed/absent. */
-function draftRaw(
-  scope: ScopeEditorState,
-): Record<string, unknown> | undefined {
-  if (scope.mutation.kind === "write") return scope.mutation.raw;
-  if (scope.mutation.kind === "remove") return undefined;
-  if (scope.source.state === "valid") return scope.source.raw;
-  return undefined;
-}
-
-function stageWrite(
-  scope: ScopeEditorState,
-  raw: Record<string, unknown>,
-): ScopeEditorState {
-  return { ...scope, mutation: { kind: "write", raw: deepCloneRaw(raw) } };
-}
-
-function stageRemove(scope: ScopeEditorState): ScopeEditorState {
-  return { ...scope, mutation: { kind: "remove" } };
-}
-
-function clearMutation(source: ConfigSource): ScopeEditorState {
-  return { source, mutation: { kind: "unchanged" } };
-}
-
-/**
- * Present baseline on a draft: undefined = omitted/inherit;
- * null = explicit unrestricted; string[] = custom list (may be empty).
- */
-function knownBaseline(
-  raw: Record<string, unknown> | undefined,
-): string[] | null | undefined {
-  if (raw === undefined) return undefined;
-  if (!Object.hasOwn(raw, "baseline")) return undefined;
-  const value = raw["baseline"];
-  if (value === null) return null;
-  if (!Array.isArray(value)) return undefined;
-  if (!value.every((entry) => typeof entry === "string")) return undefined;
-  return value as string[];
-}
-
-function knownSearch(
-  raw: Record<string, unknown> | undefined,
-): SearchConfig | undefined {
-  if (raw === undefined) return undefined;
-  const value = raw["search"];
-  if (!isPlainObject(value)) return undefined;
-  if (value["type"] === "bm25") return { type: "bm25" };
-  if (value["type"] === "llm") {
-    const model = value["model"];
-    if (typeof model === "string") return { type: "llm", model };
-    return { type: "llm" };
-  }
-  return undefined;
-}
-
-/**
- * Write baseline onto raw draft.
- * undefined → omit key (Default/Inherit);
- * null → explicit unrestricted;
- * string[] → custom list (including empty).
- */
-function setBaselineOnRaw(
-  raw: Record<string, unknown>,
-  baseline: string[] | null | undefined,
-): Record<string, unknown> {
-  const next = deepCloneRaw(raw);
-  if (baseline === undefined) delete next["baseline"];
-  else if (baseline === null) next["baseline"] = null;
-  else next["baseline"] = [...baseline];
-  return next;
-}
-
-/**
- * Update known search fields while preserving unknown nested siblings.
- * `search === undefined` removes the whole search key (Default/Inherit).
- */
-function setSearchOnRaw(
-  raw: Record<string, unknown>,
-  search: SearchConfig | undefined,
-): Record<string, unknown> {
-  const next = deepCloneRaw(raw);
-  if (search === undefined) {
-    delete next["search"];
-    return next;
-  }
-
-  const previous = isPlainObject(next["search"])
-    ? { ...(next["search"] as Record<string, unknown>) }
-    : {};
-  // Drop known keys then re-apply, keeping unknown siblings.
-  delete previous["type"];
-  delete previous["model"];
-  previous["type"] = search.type;
-  if (search.type === "llm" && search.model !== undefined) {
-    previous["model"] = search.model;
-  }
-  next["search"] = previous;
-  return next;
-}
 
 function formatBaselineList(tools: readonly string[]): string {
   if (tools.length === 0) return "(none)";
@@ -221,9 +96,33 @@ function formatResolvedBaseline(baseline: ResolvedBaseline): string {
   return formatBaselineList(baseline.tools);
 }
 
-function formatSearch(s: SearchConfig): string {
+function formatSearchConfig(s: SearchConfig): string {
   if (s.type === "bm25") return "bm25";
   return s.model !== undefined ? `llm (${s.model})` : "llm (active model)";
+}
+
+function formatSearchSelection(s: SearchSelection): string {
+  switch (s.kind) {
+    case "inherit":
+      return "inherit";
+    case "bm25":
+      return "bm25";
+    case "llm":
+      return s.model.kind === "named"
+        ? `llm (${s.model.id})`
+        : "llm (active model)";
+  }
+}
+
+function formatBaselineSelection(b: BaselineSelection): string {
+  switch (b.kind) {
+    case "inherit":
+      return "inherit";
+    case "unrestricted":
+      return "unrestricted";
+    case "list":
+      return formatBaselineList(b.tools);
+  }
 }
 
 function sourceLabel(
@@ -234,59 +133,50 @@ function sourceLabel(
   return "Default";
 }
 
-// ---------------------------------------------------------------------------
-// Resolve effective values from drafts (for display)
-// ---------------------------------------------------------------------------
-
-function resolveBaselineFromKnown(
-  value: string[] | null,
-  source: "global" | "project",
-): ResolvedBaseline {
-  if (value === null) return { kind: "unrestricted", source };
-  return { kind: "list", tools: [...value], source };
+function activeScopeSnapshot(
+  snap: ConfigEditorSnapshot,
+  scope: ScopeId,
+): ConfigScopeSnapshot {
+  return scope === "global" ? snap.global : snap.project;
 }
 
-function resolveFromDrafts(
-  global: ScopeEditorState,
-  project: ScopeEditorState,
-  projectTrusted: boolean,
-): {
-  baseline: ResolvedBaseline;
-  search: SearchConfig;
-  searchSource: "default" | "global" | "project";
-} {
-  const gRaw = draftRaw(global);
-  const pRaw =
-    projectTrusted && isWritable(project, "project", projectTrusted)
-      ? draftRaw(project)
-      : undefined;
+function formatSaveStatus(result: ConfigSaveResult): string {
+  const parts: string[] = [];
+  const globalText = formatSaveOutcome("global", result.global);
+  const projectText = formatSaveOutcome("project", result.project);
+  if (globalText !== undefined) parts.push(globalText);
+  if (projectText !== undefined) parts.push(projectText);
+  if (parts.length === 0) return "Nothing dirty - no file was written.";
+  return parts.join(" · ");
+}
 
-  const pBase = knownBaseline(pRaw);
-  const gBase = knownBaseline(gRaw);
-  let baseline: ResolvedBaseline;
-  if (pBase !== undefined) {
-    baseline = resolveBaselineFromKnown(pBase, "project");
-  } else if (gBase !== undefined) {
-    baseline = resolveBaselineFromKnown(gBase, "global");
-  } else {
-    baseline = { kind: "unrestricted", source: "default" };
+function formatSaveOutcome(
+  scope: ScopeId,
+  outcome: ScopeSaveOutcome,
+): string | undefined {
+  switch (outcome.status) {
+    case "saved":
+      return `${scope}: saved ${outcome.path}`;
+    case "removed":
+      return `${scope}: removed ${outcome.path}`;
+    case "failed":
+      return `${scope}: FAILED ${outcome.path} - ${outcome.error}`;
+    case "skipped":
+      if (outcome.reason === "untrusted") {
+        return "Project: ignored (untrusted) - not saved";
+      }
+      // not-dirty: omit from status (matches prior empty-message behavior)
+      return undefined;
   }
+}
 
-  const pSearch = knownSearch(pRaw);
-  const gSearch = knownSearch(gRaw);
-  let search: SearchConfig;
-  let searchSource: "default" | "global" | "project" = "default";
-  if (pSearch !== undefined) {
-    search = pSearch;
-    searchSource = "project";
-  } else if (gSearch !== undefined) {
-    search = gSearch;
-    searchSource = "global";
-  } else {
-    search = { type: "bm25" };
-  }
-
-  return { baseline, search, searchSource };
+function saveSucceeded(result: ConfigSaveResult): boolean {
+  return (
+    result.global.status === "saved" ||
+    result.global.status === "removed" ||
+    result.project.status === "saved" ||
+    result.project.status === "removed"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -294,37 +184,15 @@ function resolveFromDrafts(
 // ---------------------------------------------------------------------------
 
 export function createSettingsEditorState(
-  effective: EffectiveConfig,
-  projectTrusted: boolean,
-  cwd: string,
+  session: ConfigEditorSession,
 ): SettingsEditorState {
   return {
     scope: "global",
     selected: 0,
     status: "Edit drafts in memory. Ctrl+S saves. Esc closes.",
-    global: { source: effective.global, mutation: { kind: "unchanged" } },
-    project: { source: effective.project, mutation: { kind: "unchanged" } },
     view: { kind: "main" },
-    projectTrusted,
-    cwd,
+    session,
   };
-}
-
-function anyDirty(state: SettingsEditorState): boolean {
-  return isDirty(state.global) || isDirty(state.project);
-}
-
-function activeScope(state: SettingsEditorState): ScopeEditorState {
-  return state.scope === "global" ? state.global : state.project;
-}
-
-function withActiveScope(
-  state: SettingsEditorState,
-  scope: ScopeEditorState,
-): SettingsEditorState {
-  return state.scope === "global"
-    ? { ...state, global: scope }
-    : { ...state, project: scope };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +242,50 @@ function buildModelOptions(
   return options;
 }
 
+function buildModelOptionsFromSnapshot(
+  snapshot: ModelOption[],
+  configuredModel: string | undefined,
+): ModelOption[] {
+  const options = snapshot.map((o) => ({ ...o }));
+  if (
+    configuredModel !== undefined &&
+    configuredModel.length > 0 &&
+    !options.some((o) => o.model === configuredModel)
+  ) {
+    options.push({
+      id: configuredModel,
+      label: `${configuredModel} (unavailable)`,
+      model: configuredModel,
+    });
+  }
+  return options;
+}
+
+/**
+ * Scope-local or effective LLM model for picker seeding.
+ *
+ * Own LLM model wins; otherwise (including when own search is explicit BM25)
+ * seed from effective LLM model if effective search is LLM. This preserves
+ * the old persisted model when switching BM25 → LLM and confirming.
+ */
+function configuredLlmModel(
+  snap: ConfigEditorSnapshot,
+  scope: ScopeId,
+): string | undefined {
+  const active = activeScopeSnapshot(snap, scope);
+  if (active.kind === "ready") {
+    const local = active.local.search;
+    if (local.kind === "llm") {
+      return local.model.kind === "named" ? local.model.id : undefined;
+    }
+  }
+  // Own is inherit, bm25, missing, etc.: fall through to effective LLM model.
+  if (snap.effectiveSearch.type === "llm") {
+    return snap.effectiveSearch.model;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -409,7 +321,7 @@ class SettingsUiComponent implements Component {
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.ctrl("c"))) {
-      if (anyDirty(this.state)) {
+      if (this.state.session.isDirty()) {
         this.done({
           kind: "discard-request",
           editor: this.snapshotState(),
@@ -442,14 +354,15 @@ class SettingsUiComponent implements Component {
   }
 
   render(width: number): string[] {
+    const snap = this.state.session.snapshot();
     const frame = new ToolbeltFrame({
       title: "Toolbelt Settings",
       theme: this.theme,
       tabs: {
         kind: "scopes",
         active: this.state.scope,
-        globalDirty: isDirty(this.state.global),
-        projectDirty: isDirty(this.state.project),
+        globalDirty: isScopeDirty(snap.global),
+        projectDirty: isScopeDirty(snap.project),
       },
       body: {
         invalidate: () => this.invalidate(),
@@ -462,17 +375,10 @@ class SettingsUiComponent implements Component {
   }
 
   private snapshotState(): SettingsEditorState {
-    // Nested components are live objects; fine to retain by reference.
+    // Nested picker components and the config session are live objects;
+    // fine to retain by reference across discard confirmation.
     return {
       ...this.state,
-      global: {
-        ...this.state.global,
-        mutation: cloneMutation(this.state.global.mutation),
-      },
-      project: {
-        ...this.state.project,
-        mutation: cloneMutation(this.state.project.mutation),
-      },
     };
   }
 
@@ -513,16 +419,20 @@ class SettingsUiComponent implements Component {
     if (view.kind === "baseline-mode") return view.selector.render(width);
     if (view.kind === "backend") return view.selector.render(width);
     if (view.kind === "model") return view.selector.render(width);
-    const sections = this.buildSections();
+    const sections = this.buildSections(this.state.session.snapshot());
     const selected = this.clampSelected(flattenSettingsRows(sections).length);
     return renderSectionedSettings(this.theme, sections, selected, width);
+  }
+
+  private apply(edit: ConfigEdit): ConfigEditResult {
+    return this.state.session.apply(edit);
   }
 
   // ---- main navigation ------------------------------------------------
 
   private handleMainInput(data: string): void {
     if (matchesKey(data, Key.escape)) {
-      if (anyDirty(this.state)) {
+      if (this.state.session.isDirty()) {
         this.done({
           kind: "discard-request",
           editor: this.snapshotState(),
@@ -546,7 +456,9 @@ class SettingsUiComponent implements Component {
       return;
     }
 
-    const rows = flattenSettingsRows(this.buildSections());
+    const rows = flattenSettingsRows(
+      this.buildSections(this.state.session.snapshot()),
+    );
     if (rows.length === 0) {
       this.clampSelected(0);
       this.tui.requestRender();
@@ -648,66 +560,53 @@ class SettingsUiComponent implements Component {
   // ---- activate rows --------------------------------------------------
 
   private activate(id: string): void {
-    const scope = activeScope(this.state);
+    const snap = this.state.session.snapshot();
+    const scope = activeScopeSnapshot(snap, this.state.scope);
 
     if (id === "create") {
-      if (this.state.scope === "project" && !this.state.projectTrusted) return;
-      if (
-        !isWritable(scope, this.state.scope, this.state.projectTrusted) ||
-        draftRaw(scope) !== undefined
-      )
-        return;
-      if (
-        scope.source.state !== "missing" &&
-        scope.mutation.kind !== "remove"
-      ) {
-        return;
+      const result = this.apply({ type: "create", scope: this.state.scope });
+      if (result.kind === "applied") {
+        this.state.status = `Staged empty ${this.state.scope} configuration ({}). Ctrl+S to write.`;
       }
-      this.state = withActiveScope(this.state, stageWrite(scope, {}));
-      this.state.status = `Staged empty ${this.state.scope} configuration ({}). Ctrl+S to write.`;
       return;
     }
 
     if (id === "remove") {
-      if (!isWritable(scope, this.state.scope, this.state.projectTrusted))
-        return;
-      // Allow remove when file exists (valid) or write draft exists over missing.
-      if (
-        scope.source.state === "missing" &&
-        scope.mutation.kind === "unchanged"
-      ) {
-        return;
-      }
-      if (scope.mutation.kind === "remove") {
+      if (scope.kind === "removing") {
         this.state.status = "Removal already staged.";
         return;
       }
-      // If only a create draft on missing, discard back to missing.
-      if (scope.source.state === "missing" && scope.mutation.kind === "write") {
-        this.state = withActiveScope(this.state, {
-          ...scope,
-          mutation: { kind: "unchanged" },
-        });
+      const result = this.apply({ type: "remove", scope: this.state.scope });
+      if (result.kind !== "applied") return;
+      // Dirty create → missing (discard draft); clean/dirty-edit → removing.
+      const after = activeScopeSnapshot(
+        this.state.session.snapshot(),
+        this.state.scope,
+      );
+      if (after.kind === "missing") {
         this.state.status = "Discarded staged create.";
-        return;
+      } else {
+        this.state.status = `Staged removal of ${this.state.scope} configuration. Ctrl+S to delete file.`;
       }
-      this.state = withActiveScope(this.state, stageRemove(scope));
-      this.state.status = `Staged removal of ${this.state.scope} configuration. Ctrl+S to delete file.`;
       return;
     }
 
-    if (
-      !isWritable(scope, this.state.scope, this.state.projectTrusted) ||
-      scope.mutation.kind === "remove"
-    ) {
-      this.state.status = this.readOnlyStatus(scope);
-      return;
-    }
-
-    // Ensure a write draft exists before editing known fields on valid/missing.
-    if (draftRaw(scope) === undefined) {
-      this.state.status = "Create the configuration first.";
-      return;
+    switch (scope.kind) {
+      case "invalid":
+        this.state.status = `Read-only: ${scope.error}`;
+        return;
+      case "ignored":
+        this.state.status =
+          "Project configuration ignored until this project is trusted.";
+        return;
+      case "removing":
+        this.state.status = "Scope staged for removal. Save or discard.";
+        return;
+      case "missing":
+        this.state.status = "Create the configuration first.";
+        return;
+      case "ready":
+        break;
     }
 
     if (id === "baseline") {
@@ -723,22 +622,10 @@ class SettingsUiComponent implements Component {
     }
   }
 
-  private readOnlyStatus(scope: ScopeEditorState): string {
-    if (scope.source.state === "invalid") {
-      return `Read-only: ${scope.source.error}`;
-    }
-    if (scope.source.state === "ignored") {
-      return "Project configuration ignored until this project is trusted.";
-    }
-    if (scope.mutation.kind === "remove") {
-      return "Scope staged for removal. Save or discard.";
-    }
-    return "This scope is read-only.";
-  }
-
   // ---- pickers --------------------------------------------------------
 
   private openBaselineModePicker(): void {
+    const snap = this.state.session.snapshot();
     const scope = this.state.scope;
     const options: SingleSelectOption[] =
       scope === "global"
@@ -752,11 +639,14 @@ class SettingsUiComponent implements Component {
             { id: "unrestricted", label: "Unrestricted - write null" },
             { id: "custom", label: "Custom - choose tools" },
           ];
-    const own = knownBaseline(draftRaw(activeScope(this.state)));
+    const active = activeScopeSnapshot(snap, scope);
     let selected = 0;
-    if (own === undefined) selected = 0;
-    else if (own === null) selected = 1;
-    else selected = 2;
+    if (active.kind === "ready") {
+      const own = active.local.baseline;
+      if (own.kind === "inherit") selected = 0;
+      else if (own.kind === "unrestricted") selected = 1;
+      else selected = 2;
+    }
     this.state.view = {
       kind: "baseline-mode",
       selector: new SingleSelector(
@@ -771,21 +661,18 @@ class SettingsUiComponent implements Component {
   }
 
   private openBaselineEditor(): void {
-    const scope = activeScope(this.state);
-    const raw = draftRaw(scope);
-    const own = knownBaseline(raw);
-    const resolved = resolveFromDrafts(
-      this.state.global,
-      this.state.project,
-      this.state.projectTrusted,
-    );
+    const snap = this.state.session.snapshot();
+    const scopeSnap = activeScopeSnapshot(snap, this.state.scope);
     // Seed custom editor from own list, else resolved list, else empty.
-    const seed: string[] =
-      own !== undefined && own !== null
-        ? own
-        : resolved.baseline.kind === "list"
-          ? resolved.baseline.tools
-          : [];
+    let seed: readonly string[] = [];
+    if (
+      scopeSnap.kind === "ready" &&
+      scopeSnap.local.baseline.kind === "list"
+    ) {
+      seed = scopeSnap.local.baseline.tools;
+    } else if (snap.effectiveBaseline.kind === "list") {
+      seed = snap.effectiveBaseline.tools;
+    }
     const selected = new Set(seed);
     const registered = new Map(
       this.tools.map((t) => [t.name, t.description ?? ""] as const),
@@ -818,7 +705,18 @@ class SettingsUiComponent implements Component {
   }
 
   private openBackendPicker(): void {
+    const snap = this.state.session.snapshot();
     const scope = this.state.scope;
+    // Project inherit shows Global draft (or default BM25).
+    const globalSearchLabel =
+      snap.global.kind === "ready" &&
+      snap.global.local.search.kind !== "inherit"
+        ? formatSearchSelection(snap.global.local.search)
+        : formatSearchConfig(
+            snap.effectiveSearchSource === "global"
+              ? snap.effectiveSearch
+              : { type: "bm25" },
+          );
     const options: SingleSelectOption[] =
       scope === "global"
         ? [
@@ -829,20 +727,20 @@ class SettingsUiComponent implements Component {
         : [
             {
               id: "inherit",
-              label: `Inherit from Global - currently ${formatSearch(
-                // Project inherit shows Global draft (or default BM25).
-                knownSearch(draftRaw(this.state.global)) ?? { type: "bm25" },
-              )}`,
+              label: `Inherit from Global - currently ${globalSearchLabel}`,
             },
             { id: "bm25", label: "BM25 - explicit project override" },
             { id: "llm", label: "LLM - explicit project override" },
           ];
 
-    const own = knownSearch(draftRaw(activeScope(this.state)));
+    const active = activeScopeSnapshot(snap, scope);
     let selected = 0;
-    if (own === undefined) selected = 0;
-    else if (own.type === "bm25") selected = 1;
-    else selected = 2;
+    if (active.kind === "ready") {
+      const own = active.local.search;
+      if (own.kind === "inherit") selected = 0;
+      else if (own.kind === "bm25") selected = 1;
+      else selected = 2;
+    }
 
     this.state.view = {
       kind: "backend",
@@ -858,18 +756,8 @@ class SettingsUiComponent implements Component {
   }
 
   private openModelPicker(origin: "backend" | "model-row"): void {
-    const own = knownSearch(draftRaw(activeScope(this.state)));
-    const resolved = resolveFromDrafts(
-      this.state.global,
-      this.state.project,
-      this.state.projectTrusted,
-    );
-    const configuredModel =
-      own?.type === "llm"
-        ? own.model
-        : resolved.search.type === "llm"
-          ? resolved.search.model
-          : undefined;
+    const snap = this.state.session.snapshot();
+    const configuredModel = configuredLlmModel(snap, this.state.scope);
 
     // Rebuild options so unavailable configured model is included.
     const options = buildModelOptionsFromSnapshot(
@@ -907,37 +795,37 @@ class SettingsUiComponent implements Component {
       this.openBaselineEditor();
       return;
     }
-    const scope = activeScope(this.state);
-    const raw = draftRaw(scope);
-    if (raw === undefined) return;
 
+    const baseline: BaselineSelection =
+      id === "unrestricted" ? { kind: "unrestricted" } : { kind: "inherit" };
+    const result = this.apply({
+      type: "set-baseline",
+      scope: this.state.scope,
+      baseline,
+    });
+    if (result.kind !== "applied") return;
+
+    this.state.view = { kind: "main" };
     if (id === "unrestricted") {
-      const next = setBaselineOnRaw(raw, null);
-      this.state = withActiveScope(this.state, stageWrite(scope, next));
-      this.state.view = { kind: "main" };
       this.state.status =
         this.state.scope === "global"
           ? "Global baseline set to Unrestricted (null)."
           : "Project baseline set to Unrestricted (null).";
-      return;
+    } else {
+      this.state.status =
+        this.state.scope === "global"
+          ? "Global baseline set to Default."
+          : "Project baseline set to Inherit.";
     }
-
-    // default / inherit: remove baseline key
-    const next = setBaselineOnRaw(raw, undefined);
-    this.state = withActiveScope(this.state, stageWrite(scope, next));
-    this.state.view = { kind: "main" };
-    this.state.status =
-      this.state.scope === "global"
-        ? "Global baseline set to Default."
-        : "Project baseline set to Inherit.";
   }
 
   private applyBaselineCustom(tools: string[]): void {
-    const scope = activeScope(this.state);
-    const raw = draftRaw(scope);
-    if (raw === undefined) return;
-    const next = setBaselineOnRaw(raw, tools);
-    this.state = withActiveScope(this.state, stageWrite(scope, next));
+    const result = this.apply({
+      type: "set-baseline",
+      scope: this.state.scope,
+      baseline: { kind: "list", tools },
+    });
+    if (result.kind !== "applied") return;
     this.state.status = `Baseline set on ${this.state.scope} (${tools.length} tools).`;
   }
 
@@ -946,13 +834,14 @@ class SettingsUiComponent implements Component {
       this.openModelPicker("backend");
       return;
     }
-    const scope = activeScope(this.state);
-    const raw = draftRaw(scope);
-    if (raw === undefined) return;
 
     if (id === "default" || id === "inherit") {
-      const next = setSearchOnRaw(raw, undefined);
-      this.state = withActiveScope(this.state, stageWrite(scope, next));
+      const result = this.apply({
+        type: "set-search",
+        scope: this.state.scope,
+        search: { kind: "inherit" },
+      });
+      if (result.kind !== "applied") return;
       this.state.view = { kind: "main" };
       this.state.status =
         id === "inherit"
@@ -962,264 +851,171 @@ class SettingsUiComponent implements Component {
     }
 
     if (id === "bm25") {
-      const next = setSearchOnRaw(raw, { type: "bm25" });
-      this.state = withActiveScope(this.state, stageWrite(scope, next));
+      const result = this.apply({
+        type: "set-search",
+        scope: this.state.scope,
+        search: { kind: "bm25" },
+      });
+      if (result.kind !== "applied") return;
       this.state.view = { kind: "main" };
       this.state.status = `${this.state.scope} search override: bm25`;
     }
   }
 
   private applyModelChoice(optionId: string): void {
-    const scope = activeScope(this.state);
-    const raw = draftRaw(scope);
-    if (raw === undefined) return;
-
-    const currentSearch = knownSearch(raw);
-    const configuredModel =
-      currentSearch?.type === "llm" ? currentSearch.model : undefined;
+    const snap = this.state.session.snapshot();
+    const configuredModel = configuredLlmModel(snap, this.state.scope);
     const options = buildModelOptionsFromSnapshot(
       this.modelSnapshot,
       configuredModel,
     );
     const opt = options.find((o) => o.id === optionId);
-    const search: SearchConfig =
+    const search: SearchSelection =
       opt === undefined || opt.model === undefined
-        ? { type: "llm" }
-        : { type: "llm", model: opt.model };
+        ? { kind: "llm", model: { kind: "active" } }
+        : { kind: "llm", model: { kind: "named", id: opt.model } };
 
-    const next = setSearchOnRaw(raw, search);
-    this.state = withActiveScope(this.state, stageWrite(scope, next));
+    const result = this.apply({
+      type: "set-search",
+      scope: this.state.scope,
+      search,
+    });
+    if (result.kind !== "applied") return;
     this.state.view = { kind: "main" };
-    this.state.status = `${this.state.scope} search set to ${formatSearch(search)}.`;
+    this.state.status = `${this.state.scope} search set to ${formatSearchSelection(search)}.`;
   }
 
   // ---- save -----------------------------------------------------------
 
   private save(): void {
-    const messages: string[] = [];
-    let anySuccess = false;
+    const result = this.state.session.save();
 
-    // Global then Project.
-    for (const scopeId of ["global", "project"] as const) {
-      const scope =
-        scopeId === "global" ? this.state.global : this.state.project;
-      if (!isDirty(scope)) continue;
-
-      if (scopeId === "project" && !this.state.projectTrusted) {
-        messages.push("Project: ignored (untrusted) - not saved");
-        continue;
-      }
-      if (
-        !isWritable(scope, scopeId, this.state.projectTrusted) &&
-        scope.mutation.kind !== "remove"
-      ) {
-        // invalid/ignored cannot save
-        if (scope.source.state === "invalid") {
-          messages.push(`${scopeId}: invalid - not saved`);
-        }
-        continue;
-      }
-
-      const path = scope.source.path;
-      try {
-        if (scope.mutation.kind === "remove") {
-          deleteConfigFile(path);
-          const reloaded = buildEffectiveConfig(
-            this.state.cwd,
-            this.state.projectTrusted,
-          );
-          const source =
-            scopeId === "global" ? reloaded.global : reloaded.project;
-          if (scopeId === "global") {
-            this.state.global = clearMutation(source);
-          } else {
-            this.state.project = clearMutation(source);
-          }
-          messages.push(`${scopeId}: removed ${path}`);
-          anySuccess = true;
-        } else if (scope.mutation.kind === "write") {
-          writeConfigRaw(path, scope.mutation.raw);
-          const reloaded = buildEffectiveConfig(
-            this.state.cwd,
-            this.state.projectTrusted,
-          );
-          const source =
-            scopeId === "global" ? reloaded.global : reloaded.project;
-          if (scopeId === "global") {
-            this.state.global = clearMutation(source);
-          } else {
-            this.state.project = clearMutation(source);
-          }
-          messages.push(`${scopeId}: saved ${path}`);
-          anySuccess = true;
-        }
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        messages.push(`${scopeId}: FAILED ${path} - ${msg}`);
-      }
-    }
-
-    if (anySuccess) {
-      // Refresh sources for clean scopes so labels stay current after the
-      // other scope saved. Dirty scopes keep their in-memory drafts.
-      const reloaded = buildEffectiveConfig(
-        this.state.cwd,
-        this.state.projectTrusted,
-      );
-      if (!isDirty(this.state.global)) {
-        this.state.global = {
-          source: reloaded.global,
-          mutation: { kind: "unchanged" },
-        };
-      }
-      if (!isDirty(this.state.project)) {
-        this.state.project = {
-          source: reloaded.project,
-          mutation: { kind: "unchanged" },
-        };
-      }
+    if (saveSucceeded(result)) {
+      // Refresh subsequent configuration reads only. Never mutates tools.
       this.onConfigSaved?.();
     }
 
-    this.state.status =
-      messages.length > 0
-        ? messages.join(" · ")
-        : "Nothing dirty - no file was written.";
+    this.state.status = formatSaveStatus(result);
     this.tui.requestRender();
   }
 
   // ---- sections / rows ------------------------------------------------
 
-  private buildSections(): SettingsSection[] {
-    const scope = activeScope(this.state);
+  private buildSections(snap: ConfigEditorSnapshot): SettingsSection[] {
     const scopeId = this.state.scope;
+    const scope = activeScopeSnapshot(snap, scopeId);
 
-    // Untrusted project: always read-only, whether missing or ignored-on-disk.
-    if (scopeId === "project" && !this.state.projectTrusted) {
-      return [
-        {
-          title: "PROJECT",
-          rows: [
-            {
-              id: "ignored",
-              label: "Status",
-              value: "ignored until trusted",
-              note: scope.source.path,
-              source: "Action",
-            },
-          ],
-        },
-      ];
+    switch (scope.kind) {
+      case "ignored":
+        return [
+          {
+            title: "PROJECT",
+            rows: [
+              {
+                id: "ignored",
+                label: "Status",
+                value: "ignored until trusted",
+                note: scope.path,
+                source: "Action",
+              },
+            ],
+          },
+        ];
+
+      case "invalid":
+        return [
+          {
+            title: "ERROR",
+            rows: [
+              {
+                id: "invalid",
+                label: "Invalid",
+                value: scope.error,
+                note: scope.path,
+                source: "Action",
+              },
+            ],
+          },
+        ];
+
+      case "removing":
+        return [
+          {
+            title: "SCOPE",
+            rows: [
+              {
+                id: "remove",
+                label: "Remove",
+                value: "staged - Ctrl+S deletes file",
+                note: scope.path,
+                source: "Action",
+              },
+            ],
+          },
+        ];
+
+      case "missing": {
+        const label =
+          scopeId === "global"
+            ? "Create global configuration"
+            : "Create project configuration";
+        return [
+          {
+            title: "SCOPE",
+            rows: [
+              {
+                id: "create",
+                label: "Create",
+                value: label,
+                note: scope.path,
+                source: "Action",
+              },
+            ],
+          },
+        ];
+      }
+
+      case "ready":
+        return this.buildReadySections(snap, scopeId, scope.local, scope.path);
     }
+  }
 
-    // Invalid
-    if (scope.source.state === "invalid") {
-      return [
-        {
-          title: "ERROR",
-          rows: [
-            {
-              id: "invalid",
-              label: "Invalid",
-              value: scope.source.error,
-              note: scope.source.path,
-              source: "Action",
-            },
-          ],
-        },
-      ];
-    }
-
-    // Staged removal
-    if (scope.mutation.kind === "remove") {
-      return [
-        {
-          title: "SCOPE",
-          rows: [
-            {
-              id: "remove",
-              label: "Remove",
-              value: "staged - Ctrl+S deletes file",
-              note: scope.source.path,
-              source: "Action",
-            },
-          ],
-        },
-      ];
-    }
-
-    // Missing with no create draft
-    if (draftRaw(scope) === undefined) {
-      const label =
-        scopeId === "global"
-          ? "Create global configuration"
-          : "Create project configuration";
-      return [
-        {
-          title: "SCOPE",
-          rows: [
-            {
-              id: "create",
-              label: "Create",
-              value: label,
-              note: scope.source.path,
-              source: "Action",
-            },
-          ],
-        },
-      ];
-    }
-
-    const resolved = resolveFromDrafts(
-      this.state.global,
-      this.state.project,
-      this.state.projectTrusted,
-    );
-    const raw = draftRaw(scope);
-    const ownBase = knownBaseline(raw);
-    const ownSearch = knownSearch(raw);
+  private buildReadySections(
+    snap: ConfigEditorSnapshot,
+    scopeId: ScopeId,
+    local: LocalConfig,
+    path: string,
+  ): SettingsSection[] {
+    const ownBase = local.baseline;
+    const ownSearch = local.search;
 
     // Baseline display — unrestricted shown distinctly from list membership.
+    // When local is inherit, pair effective value with its actual effective source
+    // (including Project when Project is the source). Do not hardcode Default
+    // for the Global tab.
     let baselineValue: string;
     let baselineSource: ValueSourceLabel;
     let baselineNote: string | undefined;
-    if (ownBase !== undefined) {
-      baselineValue =
-        ownBase === null ? "unrestricted" : formatBaselineList(ownBase);
+    if (ownBase.kind !== "inherit") {
+      baselineValue = formatBaselineSelection(ownBase);
       baselineSource = scopeId === "global" ? "Global" : "Project";
     } else {
-      baselineValue = formatResolvedBaseline(resolved.baseline);
-      if (scopeId === "global") {
-        baselineSource = "Default";
-        baselineNote = "(inherited from Default)";
-      } else if (resolved.baseline.source === "global") {
-        baselineSource = "Global";
-        baselineNote = "(inherited from Global)";
-      } else {
-        baselineSource = "Default";
-        baselineNote = "(inherited from Default)";
-      }
+      baselineValue = formatResolvedBaseline(snap.effectiveBaseline);
+      baselineSource = sourceLabel(snap.effectiveBaseline.source);
+      baselineNote = `(inherited from ${baselineSource})`;
     }
 
-    // Search display
+    // Search display — same inherit parity as baseline.
     let searchValue: string;
     let searchSource: ValueSourceLabel;
     let searchNote: string | undefined;
-    if (ownSearch !== undefined) {
-      searchValue = formatSearch(ownSearch);
+    if (ownSearch.kind !== "inherit") {
+      searchValue = formatSearchSelection(ownSearch);
       searchSource = scopeId === "global" ? "Global" : "Project";
     } else {
-      searchValue = formatSearch(resolved.search);
-      if (scopeId === "global") {
-        searchSource = "Default";
-        searchNote = "(inherited from Default)";
-      } else if (resolved.searchSource === "global") {
-        searchSource = "Global";
-        searchNote = "(inherited from Global)";
-      } else {
-        searchSource = "Default";
-        searchNote = "(inherited from Default)";
-      }
+      searchValue = formatSearchConfig(snap.effectiveSearch);
+      searchSource = sourceLabel(snap.effectiveSearchSource);
+      searchNote = `(inherited from ${searchSource})`;
     }
 
     const baselineRow: import("./ui/sectioned-settings.js").SettingsRow = {
@@ -1249,20 +1045,29 @@ class SettingsUiComponent implements Component {
       },
     ];
 
+    const ownIsLlm = ownSearch.kind === "llm";
+    const ownOmitted = ownSearch.kind === "inherit";
     const showModel =
-      ownSearch?.type === "llm" ||
-      (ownSearch === undefined && resolved.search.type === "llm");
+      ownIsLlm || (ownOmitted && snap.effectiveSearch.type === "llm");
     if (showModel) {
-      const model =
-        (ownSearch?.type === "llm" ? ownSearch.model : undefined) ??
-        (resolved.search.type === "llm" ? resolved.search.model : undefined);
-      const modelText = model ?? "active model";
-      const modelSource: ValueSourceLabel =
-        ownSearch?.type === "llm"
-          ? scopeId === "global"
-            ? "Global"
-            : "Project"
-          : sourceLabel(resolved.searchSource);
+      let modelText: string;
+      if (ownIsLlm) {
+        modelText =
+          ownSearch.model.kind === "named"
+            ? ownSearch.model.id
+            : "active model";
+      } else {
+        modelText =
+          snap.effectiveSearch.type === "llm" &&
+          snap.effectiveSearch.model !== undefined
+            ? snap.effectiveSearch.model
+            : "active model";
+      }
+      const modelSource: ValueSourceLabel = ownIsLlm
+        ? scopeId === "global"
+          ? "Global"
+          : "Project"
+        : sourceLabel(snap.effectiveSearchSource);
       sections[1]?.rows.push({
         id: "search.model",
         label: "LLM model",
@@ -1278,6 +1083,7 @@ class SettingsUiComponent implements Component {
           id: "remove",
           label: "Remove",
           value: "Remove scope configuration",
+          note: path,
           source: "Action",
         },
       ],
@@ -1287,30 +1093,22 @@ class SettingsUiComponent implements Component {
   }
 }
 
-function cloneMutation(mutation: ScopeMutation): ScopeMutation {
-  if (mutation.kind === "write") {
-    return { kind: "write", raw: deepCloneRaw(mutation.raw) };
-  }
-  return mutation;
-}
+// ---------------------------------------------------------------------------
+// Snapshot helpers (UI-owned presentation facts only)
+// ---------------------------------------------------------------------------
 
-function buildModelOptionsFromSnapshot(
-  snapshot: ModelOption[],
-  configuredModel: string | undefined,
-): ModelOption[] {
-  const options = snapshot.map((o) => ({ ...o }));
-  if (
-    configuredModel !== undefined &&
-    configuredModel.length > 0 &&
-    !options.some((o) => o.model === configuredModel)
-  ) {
-    options.push({
-      id: configuredModel,
-      label: `${configuredModel} (unavailable)`,
-      model: configuredModel,
-    });
+function isScopeDirty(scope: ConfigScopeSnapshot): boolean {
+  switch (scope.kind) {
+    case "ready":
+      return scope.dirty;
+    case "ignored":
+      return scope.dirty;
+    case "removing":
+      return true;
+    case "missing":
+    case "invalid":
+      return false;
   }
-  return options;
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,24 +1123,21 @@ export async function openSettingsUi(
     tools?: ToolInfo[];
   } = {},
 ): Promise<SettingsUiResult> {
-  const projectTrusted = ctx.isProjectTrusted?.() ?? false;
-  const effective = buildEffectiveConfig(ctx.cwd, projectTrusted);
+  // Live trust getter — rechecked on every Project mutation and disk write.
+  const isProjectTrusted = (): boolean => ctx.isProjectTrusted?.() ?? false;
+
   const initial =
     options.initialState ??
-    createSettingsEditorState(effective, projectTrusted, ctx.cwd);
+    createSettingsEditorState(
+      createConfigEditorSession(ctx.cwd, isProjectTrusted),
+    );
 
-  // Keep trust/cwd fresh even when reopening retained state.
-  initial.projectTrusted = projectTrusted;
-  initial.cwd = ctx.cwd;
+  // Reopens retain the same dirty session; only UI view is reset by commands.
+  // Trust is always live via the getter closed over `ctx`.
 
   const tools = options.tools ?? [];
-  const configuredModel = (() => {
-    const raw = draftRaw(
-      initial.scope === "global" ? initial.global : initial.project,
-    );
-    const search = knownSearch(raw);
-    return search?.type === "llm" ? search.model : undefined;
-  })();
+  const snap = initial.session.snapshot();
+  const configuredModel = configuredLlmModel(snap, initial.scope);
   const modelSnapshot = buildModelOptions(ctx, configuredModel);
 
   return ctx.ui.custom<SettingsUiResult>(

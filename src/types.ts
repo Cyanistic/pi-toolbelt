@@ -34,36 +34,39 @@ export type BaselineSource = "default" | "global" | "project";
  * with an empty allowlist.
  */
 export type ResolvedBaseline =
-  | { kind: "unrestricted"; source: BaselineSource }
-  | { kind: "list"; tools: string[]; source: BaselineSource };
+  | { readonly kind: "unrestricted"; readonly source: BaselineSource }
+  | {
+      readonly kind: "list";
+      readonly tools: readonly string[];
+      readonly source: BaselineSource;
+    };
 
 // ---------------------------------------------------------------------------
-// Config sources (tagged states)
+// Config sources (tagged states — no raw JSON on the public surface)
 // ---------------------------------------------------------------------------
 
 /** No file exists at the scope path. */
 export interface MissingConfigSource {
-  state: "missing";
-  path: string;
+  readonly state: "missing";
+  readonly path: string;
 }
 
 /**
  * File is a JSON object whose present known fields validate.
- * Includes `{}` and unknown-only objects. `raw` is a deep clone for
- * round-trip editing; `config` holds only validated known fields.
+ * Includes `{}` and unknown-only objects. `config` holds only validated
+ * known fields; raw round-trip data stays private to the configuration module.
  */
 export interface ValidConfigSource {
-  state: "valid";
-  path: string;
-  config: Partial<ToolbeltConfig>;
-  raw: Record<string, unknown>;
+  readonly state: "valid";
+  readonly path: string;
+  readonly config: Partial<ToolbeltConfig>;
 }
 
 /** File exists but JSON parse or known-field validation failed. */
 export interface InvalidConfigSource {
-  state: "invalid";
-  path: string;
-  error: string;
+  readonly state: "invalid";
+  readonly path: string;
+  readonly error: string;
 }
 
 /**
@@ -71,8 +74,8 @@ export interface InvalidConfigSource {
  * file is not parsed, validated, merged, or written.
  */
 export interface IgnoredConfigSource {
-  state: "ignored";
-  path: string;
+  readonly state: "ignored";
+  readonly path: string;
 }
 
 /** Result from reading a single config scope. */
@@ -85,21 +88,21 @@ export type ConfigSource =
 /** Resolved configuration combining trusted global + project sources. */
 export interface EffectiveConfig {
   /** Effective baseline: unrestricted or exact allowlist, with source. */
-  baseline: ResolvedBaseline;
-  search: SearchConfig;
+  readonly baseline: ResolvedBaseline;
+  readonly search: SearchConfig;
   /** Which scopes contributed known config (valid only). */
-  source: "global" | "project" | "both" | "none";
-  searchSource: "default" | "global" | "project";
-  globalPath: string;
-  projectPath: string;
-  global: ConfigSource;
-  project: ConfigSource;
+  readonly source: "global" | "project" | "both" | "none";
+  readonly searchSource: "default" | "global" | "project";
+  readonly globalPath: string;
+  readonly projectPath: string;
+  readonly global: ConfigSource;
+  readonly project: ConfigSource;
   /**
    * True when no participating scope is invalid — including when both
    * scopes are missing (default configuration). Ignored Project never
    * participates. Malformed participating scopes disable config-driven mode.
    */
-  configured: boolean;
+  readonly configured: boolean;
 }
 
 // ---------------------------------------------------------------------------

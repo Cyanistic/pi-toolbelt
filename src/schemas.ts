@@ -163,10 +163,12 @@ export type DiscoveryReceipt = Static<typeof DiscoveryReceiptSchema>;
  * Manage-tools action. Type.Enum emits JSON Schema `enum` (Google-compatible);
  * do not use Type.Union of Type.Literal for provider-facing tool parameters.
  */
-export const ToolManagementActionSchema = Type.Enum([
-  "activate",
-  "deactivate",
-] as const);
+export const ToolManagementActionSchema = Type.Enum(
+  ["activate", "deactivate"] as const,
+  {
+    description: "Whether to activate or deactivate every supplied tool name",
+  },
+);
 
 export type ToolManagementAction = Static<typeof ToolManagementActionSchema>;
 
@@ -202,9 +204,7 @@ export const QueryToolsParamsSchema = Type.Object({
 
 /** manage_tools parameter schema. */
 export const ManageToolsParamsSchema = Type.Object({
-  action: Type.Options(ToolManagementActionSchema, {
-    description: "Whether to activate or deactivate every supplied tool name",
-  }),
+  action: ToolManagementActionSchema,
   tools: Type.Array(Type.String(), {
     minItems: 1,
     description: "One or more exact registered tool names",
