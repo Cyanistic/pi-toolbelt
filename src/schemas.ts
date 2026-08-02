@@ -6,7 +6,10 @@
  */
 
 import { type Static, Type } from "typebox";
-import { ACTIVE_TOOL_SNAPSHOT_VERSION } from "./constants.js";
+import {
+  ACTIVE_TOOL_SNAPSHOT_VERSION,
+  DEFAULT_LLM_TIMEOUT_MS,
+} from "./constants.js";
 
 // ---------------------------------------------------------------------------
 // Search configuration (discriminated on type)
@@ -195,9 +198,9 @@ export const QueryToolsParamsSchema = Type.Object({
   timeoutMs: Type.Optional(
     Type.Integer({
       minimum: 0,
-      default: 5000,
+      default: DEFAULT_LLM_TIMEOUT_MS,
       description:
-        "LLM-ranking timeout in ms (default: 5000, 0 = disable mode timeout)",
+        "LLM-ranking timeout in ms (default: 30000, 0 = disable mode timeout)",
     }),
   ),
 });

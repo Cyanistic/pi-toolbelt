@@ -11,4 +11,3 @@ Pi extension for progressive tool discovery and explicit session tool management
 | [docs/behavior.md](docs/behavior.md) | session_start, snapshots, runtime modes, discovery |
 | [docs/releasing.md](docs/releasing.md) | Changelog ownership, preview, prepare, manual tag/publish |
 | [openspec/](openspec/) | Spec-driven change workflow (proposal / design / delta specs / tasks) |
-| Active change | `openspec/changes/opt-in-baseline-publish-ready/` |

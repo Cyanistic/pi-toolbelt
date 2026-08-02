@@ -191,6 +191,10 @@ async function resolveModel(
 // Helpers
 // ---------------------------------------------------------------------------
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function isLlmSearchResult(
   r: LlmSearchResult | LlmSearchError,
 ): r is LlmSearchResult {
@@ -227,7 +231,14 @@ export async function llmRank(
   configuredModel?: string,
 ): Promise<LlmSearchResult | LlmSearchError> {
   // Resolve model
-  const resolved = await resolveModel(ctx, configuredModel);
+  const resolved = await resolveModel(ctx, configuredModel).catch(
+    (error: unknown) => ({
+      error: {
+        code: "provider_failure" as const,
+        message: errorMessage(error),
+      },
+    }),
+  );
   if ("error" in resolved) {
     return resolved.error;
   }
@@ -235,7 +246,12 @@ export async function llmRank(
   const { model, modelId } = resolved;
 
   // Resolve authentication for the selected model
-  const auth = await ctx.modelRegistry?.getApiKeyAndHeaders(model);
+  const auth = await ctx.modelRegistry
+    ?.getApiKeyAndHeaders(model)
+    .catch((error: unknown) => ({
+      ok: false as const,
+      error: errorMessage(error),
+    }));
   if (!auth?.ok) {
     return {
       code: "auth_unavailable",
@@ -341,7 +357,7 @@ export async function llmRank(
 
     return {
       code: "provider_failure",
-      message: e instanceof Error ? e.message : String(e),
+      message: errorMessage(e),
     };
   } finally {
     // Clean up
