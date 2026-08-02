@@ -7,7 +7,7 @@ Toolbelt keeps active-tool membership deliberate. The model discovers inactive t
 ## Install
 
 ```sh
-pi install npm:pi-toolbelt
+pi install npm:@cyanism/pi-toolbelt
 ```
 
 Install alone is enough for discovery and management. No `toolbelt.json` is required for the happy path.
