@@ -30,6 +30,10 @@ function autocompleteItem(
     : { value, label, description };
 }
 
+import {
+  computeStartupActiveTools,
+  formatResolvedBaseline,
+} from "./baseline.js";
 import { handleToolbeltCommand } from "./commands.js";
 import {
   buildEffectiveConfig,
@@ -53,7 +57,6 @@ import type { ToolDiscoveryResult } from "./schemas.js";
 import { ManageToolsParamsSchema, QueryToolsParamsSchema } from "./schemas.js";
 import { buildToolIndex, SearchEngine } from "./search.js";
 import {
-  filterRegisteredTools,
   hasActiveToolSnapshot,
   persistActiveTools,
   restoreActiveToolSnapshot,
@@ -71,7 +74,10 @@ const COMPS: Record<string, CompletionNode> = {
   settings: { description: "Edit persistent configuration" },
   tools: { description: "Inspect and change active session tools" },
   status: { description: "Show current toolbelt state" },
-  reset: { description: "Restore baseline or activate all registered tools" },
+  reset: {
+    description:
+      "Restore the resolved baseline, including unrestricted removals",
+  },
 };
 
 const INACTIVE_GUIDANCE =
@@ -617,26 +623,33 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // No snapshot: apply list baseline only; unrestricted leaves host set alone.
-    if (effective.configured && effective.baseline.kind === "list") {
-      const active = filterRegisteredTools(pi, effective.baseline.tools);
-      pi.setActiveTools(active);
-      currentRuntime = resolveRuntimeMode(effective, false);
-      if (debug) {
-        ctx.ui.notify(
-          `[toolbelt] list baseline applied: ${active.join(", ") || "(none)"} (source: ${effective.baseline.source})`,
-          "info",
-        );
+    // No snapshot: exact clamps; unrestricted may apply named add/remove only.
+    if (effective.configured) {
+      const registeredNames = pi.getAllTools().map((tool) => tool.name);
+      const next = computeStartupActiveTools(
+        effective.baseline,
+        registeredNames,
+        pi.getActiveTools(),
+      );
+      if (next !== undefined) {
+        pi.setActiveTools(next);
+        currentRuntime = resolveRuntimeMode(effective, false);
+        if (debug) {
+          ctx.ui.notify(
+            `[toolbelt] baseline applied: ${next.join(", ") || "(none)"} (${formatResolvedBaseline(effective.baseline)})`,
+            "info",
+          );
+        }
+        return;
       }
-      return;
     }
 
-    // Configured unrestricted (or config unusable without snapshot): no mutation.
+    // Unmodified unrestricted, or config unusable without snapshot: no mutation.
     currentRuntime = resolveRuntimeMode(effective, false);
     if (debug) {
       if (effective.configured) {
         ctx.ui.notify(
-          `[toolbelt] unrestricted baseline - host active set left unchanged (source: ${effective.baseline.source})`,
+          `[toolbelt] unrestricted baseline - host active set left unchanged (${formatResolvedBaseline(effective.baseline)})`,
           "info",
         );
       } else {

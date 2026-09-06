@@ -24,7 +24,7 @@ Known fields (both optional):
 
 | Field | Allowed values | Notes |
 |---|---|---|
-| `baseline` | JSON `null`, or `string[]` (including `[]`) | See [Baseline](#baseline) |
+| `baseline` | JSON `null`, `string[]` (including `[]`), or `{ "type": "modify", "add"?: string[], "remove"?: string[] }` | See [Baseline](#baseline) |
 | `search` | `{ "type": "bm25" }` or `{ "type": "llm", "model"?: "provider/id" }` | See [Search](#search) |
 
 Rules:
@@ -32,65 +32,82 @@ Rules:
 - `{}` and unknown-only objects are **valid** configured scopes.
 - Unknown top-level and nested-under-`search` properties are ignored at runtime and **preserved** when settings saves known fields.
 - Invalid JSON, a non-object root, or an invalid known field makes that scope **malformed**. Settings leaves the file untouched and shows a path-level error. Config-driven runtime stays disabled until every **participating** scope is valid.
-- Invalid `baseline` types (number, object, etc.) fail validation. Present values must be `null` or an array of strings.
+- Present `baseline` must be `null`, a string array, or a valid tagged `modify` object. Other types fail validation.
+- A `modify` object is invalid when `type` is not `"modify"`, it has unknown fields, both `add` and `remove` are empty or absent, either list contains an empty name, or one name appears in both lists. Duplicate names in one list are accepted and kept once, first-seen order.
 - Legacy fields such as `threshold` and `topK` are not recognized as known search shape.
+- An older Toolbelt release that does not know `modify` treats that object as a malformed `baseline`. Downgrade by replacing it with omitted, `null`, or an array.
 
 ## Baseline
 
-`baseline` is optional on each scope. Effective baseline is a tagged value: **unrestricted** or **list** (with tool names). Unrestricted is never represented as a synthetic tool list, so empty allowlist and unrestricted stay distinct.
+`baseline` is optional on each scope. Effective policy is **exact** (an ordered tool set, including empty) or **unrestricted** (with optional named additions and removals). Unrestricted is never turned into a synthetic tool list, so empty allowlist and unrestricted stay distinct.
 
 | Present value | Meaning |
 |---|---|
-| omitted | Inherit parent scope. Omitted through the full chain → root default **unrestricted** (`source: default`). |
-| `null` | Explicit **unrestricted**. Source is the scope that wrote `null` (global or project). |
-| non-empty `string[]` | Exact allowlist. Source is that scope. |
-| `[]` | Exact allowlist of **zero** tools - not unrestricted. |
+| omitted | No operation. Keep inherited state. Full chain omitted → Default **unrestricted**. |
+| `null` | Replace inherited state with unrestricted and clear earlier add/remove overlays. |
+| non-empty `string[]` | Replace inherited state with that exact set. |
+| `[]` | Replace inherited state with an exact set of **zero** tools - not unrestricted. |
+| `{ "type": "modify", "add"?: string[], "remove"?: string[] }` | Transform inherited state. At least one of `add` or `remove` must be a non-empty list. |
 
-Resolution order: project (if trusted and defines `baseline`) → global (if defines `baseline`) → default unrestricted.
+Resolution starts at Default unrestricted, then applies Global, then trusted Project. A later layer can reverse an earlier add or remove. Omitted layers do not appear in the contribution chain. Replacement (`null` or array) stays visible in the chain as a reset of inherited policy.
+
+Settings and `/toolbelt status` show that ordered chain plus the effective exact or unrestricted result. Search still has a single source (Default, Global, or Project).
 
 Examples:
 
+Global exact clamp:
+
 ```json
-// Global only - explicit clamp
 { "baseline": ["read", "bash", "edit", "write"] }
 ```
 
+Global exact, trusted Project replaces with unrestricted:
+
 ```json
-// Global list + project override to everything
-// Global: { "baseline": ["read", "bash"] }
-// Project (trusted):
 { "baseline": null }
 ```
 
+Trusted Project inherits Global (omit `baseline`):
+
 ```json
-// Global list + project inherits (omit key)
-// Project file may be {} or omit baseline entirely
 {}
 ```
 
+Empty exact set - new session / exact reset → zero registered tools:
+
 ```json
-// Empty allowlist - new session / list reset → zero registered tools
 { "baseline": [] }
+```
+
+Global modify over Default unrestricted. Startup activates `grep` and deactivates `bash`. Reset still targets every registered tool except `bash`:
+
+```json
+{ "baseline": { "type": "modify", "add": ["grep"], "remove": ["bash"] } }
+```
+
+Trusted Project reverses a Global removal of `bash`:
+
+```json
+{ "baseline": { "type": "modify", "add": ["bash"] } }
 ```
 
 ### Settings write table
 
-`/toolbelt settings` baseline mode picker:
+`/toolbelt settings` baseline mode picker (both Global and Project):
 
 | Scope | Mode | Disk write |
 |---|---|---|
-| Global | Default | omit `baseline` |
-| Global | Unrestricted | `"baseline": null` |
-| Global | Custom | `"baseline": string[]` (empty allowed) |
-| Project | Inherit | omit `baseline` |
-| Project | Unrestricted | `"baseline": null` |
-| Project | Custom | `"baseline": string[]` (empty allowed) |
+| Global | Inherit | omit `baseline` (uses Default) |
+| Project | Inherit | omit `baseline` (uses Global or Default) |
+| either | Unrestricted | `"baseline": null` |
+| either | Exact | `"baseline": string[]` (empty allowed) |
+| either | Modify | `"baseline": { "type": "modify", ... }` |
 
-Global Default and Global Unrestricted both resolve unrestricted while the product root default is unrestricted; Unrestricted is an explicit pin if that default ever changes. On project, omit vs `null` is load-bearing (inherit a global list vs override to everything).
+Global Inherit and Global Unrestricted both resolve unrestricted while the product root default is unrestricted; Unrestricted is an explicit pin if that default ever changes. On project, omit vs `null` is load-bearing (inherit a global exact set vs override to unrestricted).
 
-Custom picker: searchable multi-select over registered tools, keeps unavailable configured names until deselected, and can add arbitrary exact non-empty tool names from search text.
+Exact and Modify pickers: searchable multi-select over registered tools, keep unavailable configured names until deselected, and can add arbitrary exact non-empty tool names from search text. Modify uses separate Add and Remove rows. Selecting a name in one row moves it out of the other. Confirming Modify with both rows empty writes Inherit, not an invalid empty object.
 
-Saving settings refreshes effective config for discovery. It does **not** call `setActiveTools` and does **not** write a session snapshot when only baseline changes.
+Saving settings refreshes effective config for discovery. It does **not** call `setActiveTools` and does **not** write a session snapshot when only baseline changes. After a baseline save, settings points at `/toolbelt reset` to apply it to the current session.
 
 ## Search
 
@@ -125,11 +142,20 @@ Unrestricted pin + LLM:
 }
 ```
 
-List baseline + local search:
+Exact baseline + local search:
 
 ```json
 {
   "baseline": ["read", "bash", "edit", "write", "grep"],
+  "search": { "type": "bm25" }
+}
+```
+
+Layered Project modify + local search:
+
+```json
+{
+  "baseline": { "type": "modify", "add": ["grep"], "remove": ["bash"] },
   "search": { "type": "bm25" }
 }
 ```

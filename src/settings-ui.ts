@@ -19,6 +19,13 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
+  formatBaselineTrace,
+  formatModifyLists,
+  formatResolvedBaseline,
+  resolvedPolicyEqual,
+  uniquePreserveOrder,
+} from "./baseline.js";
+import {
   type BaselineSelection,
   type ConfigEdit,
   type ConfigEditorSession,
@@ -32,7 +39,7 @@ import {
   type ScopeSaveOutcome,
   type SearchSelection,
 } from "./config.js";
-import type { ResolvedBaseline, SearchConfig } from "./types.js";
+import type { SearchConfig } from "./types.js";
 import { FuzzyMultiSelector } from "./ui/fuzzy-multi-selector.js";
 import {
   flattenSettingsRows,
@@ -57,6 +64,19 @@ export type SettingsView =
   | { kind: "main" }
   | { kind: "baseline-mode"; selector: SingleSelector }
   | { kind: "baseline"; editor: FuzzyMultiSelector }
+  | {
+      kind: "baseline-modify";
+      add: string[];
+      remove: string[];
+      selected: number;
+    }
+  | {
+      kind: "baseline-modify-picker";
+      operation: "add" | "remove";
+      add: string[];
+      remove: string[];
+      editor: FuzzyMultiSelector;
+    }
   | { kind: "backend"; selector: SingleSelector }
   | {
       kind: "model";
@@ -91,11 +111,6 @@ function formatBaselineList(tools: readonly string[]): string {
   return `${tools.slice(0, 3).join(", ")} +${tools.length - 3}`;
 }
 
-function formatResolvedBaseline(baseline: ResolvedBaseline): string {
-  if (baseline.kind === "unrestricted") return "unrestricted";
-  return formatBaselineList(baseline.tools);
-}
-
 function formatSearchConfig(s: SearchConfig): string {
   if (s.type === "bm25") return "bm25";
   return s.model !== undefined ? `llm (${s.model})` : "llm (active model)";
@@ -121,7 +136,9 @@ function formatBaselineSelection(b: BaselineSelection): string {
     case "unrestricted":
       return "unrestricted";
     case "list":
-      return formatBaselineList(b.tools);
+      return `exact ${formatBaselineList(b.tools)}`;
+    case "modify":
+      return formatModifyLists(b.add, b.remove);
   }
 }
 
@@ -130,6 +147,12 @@ function sourceLabel(
 ): ValueSourceLabel {
   if (source === "global") return "Global";
   if (source === "project") return "Project";
+  return "Default";
+}
+
+function sourceLabelFromTrace(scope: string | undefined): ValueSourceLabel {
+  if (scope === "Global") return "Global";
+  if (scope === "Project") return "Project";
   return "Default";
 }
 
@@ -314,6 +337,7 @@ class SettingsUiComponent implements Component {
   invalidate(): void {
     const view = this.state.view;
     if (view.kind === "baseline") view.editor.invalidate();
+    if (view.kind === "baseline-modify-picker") view.editor.invalidate();
     if (view.kind === "baseline-mode") view.selector.invalidate();
     if (view.kind === "backend") view.selector.invalidate();
     if (view.kind === "model") view.selector.invalidate();
@@ -335,6 +359,14 @@ class SettingsUiComponent implements Component {
     const view = this.state.view;
     if (view.kind === "baseline") {
       this.handleBaselineInput(data);
+      return;
+    }
+    if (view.kind === "baseline-modify") {
+      this.handleModifierDraftInput(data);
+      return;
+    }
+    if (view.kind === "baseline-modify-picker") {
+      this.handleModifierPickerInput(data);
       return;
     }
     if (view.kind === "baseline-mode") {
@@ -384,8 +416,11 @@ class SettingsUiComponent implements Component {
 
   private footerText(): string {
     const view = this.state.view;
-    if (view.kind === "baseline") {
+    if (view.kind === "baseline" || view.kind === "baseline-modify-picker") {
       return "Baseline · Space toggle · Enter confirm · Esc cancel";
+    }
+    if (view.kind === "baseline-modify") {
+      return "Modify · Enter edit row · Apply confirms · Esc cancel";
     }
     if (
       view.kind === "baseline-mode" ||
@@ -416,6 +451,11 @@ class SettingsUiComponent implements Component {
   private renderBody(width: number): string[] {
     const view = this.state.view;
     if (view.kind === "baseline") return view.editor.render(width);
+    if (view.kind === "baseline-modify-picker")
+      return view.editor.render(width);
+    if (view.kind === "baseline-modify") {
+      return this.renderModifierDraft(width, view);
+    }
     if (view.kind === "baseline-mode") return view.selector.render(width);
     if (view.kind === "backend") return view.selector.render(width);
     if (view.kind === "model") return view.selector.render(width);
@@ -498,6 +538,109 @@ class SettingsUiComponent implements Component {
       const checked = view.editor.confirmSelection();
       this.applyBaselineCustom(checked);
       this.state.view = { kind: "main" };
+      this.tui.requestRender();
+      return;
+    }
+    view.editor.handleInput(data);
+    this.tui.requestRender();
+  }
+
+  private modifierDraftRows(
+    add: readonly string[],
+    remove: readonly string[],
+  ): import("./ui/sectioned-settings.js").SettingsRow[] {
+    return [
+      {
+        id: "mod-add",
+        label: "Add",
+        value: add.length === 0 ? "(none)" : formatBaselineList(add),
+        source: "Action",
+      },
+      {
+        id: "mod-remove",
+        label: "Remove",
+        value: remove.length === 0 ? "(none)" : formatBaselineList(remove),
+        source: "Action",
+      },
+      {
+        id: "mod-apply",
+        label: "Apply",
+        value:
+          add.length === 0 && remove.length === 0
+            ? "empty → Inherit"
+            : formatModifyLists(add, remove),
+        source: "Action",
+      },
+    ];
+  }
+
+  private renderModifierDraft(
+    width: number,
+    view: Extract<SettingsView, { kind: "baseline-modify" }>,
+  ): string[] {
+    const sections: SettingsSection[] = [
+      {
+        title: `MODIFY ${this.state.scope.toUpperCase()}`,
+        rows: this.modifierDraftRows(view.add, view.remove),
+      },
+    ];
+    return renderSectionedSettings(this.theme, sections, view.selected, width);
+  }
+
+  private handleModifierDraftInput(data: string): void {
+    const view = this.state.view;
+    if (view.kind !== "baseline-modify") return;
+
+    if (matchesKey(data, Key.escape)) {
+      this.state.view = { kind: "main" };
+      this.state.status = "Modify cancelled - draft unchanged.";
+      this.tui.requestRender();
+      return;
+    }
+
+    const rows = this.modifierDraftRows(view.add, view.remove);
+    if (matchesKey(data, Key.up)) {
+      view.selected = view.selected === 0 ? rows.length - 1 : view.selected - 1;
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      view.selected = view.selected === rows.length - 1 ? 0 : view.selected + 1;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.enter) || matchesKey(data, Key.space)) {
+      const row = rows[view.selected];
+      if (row?.id === "mod-add") {
+        this.openModifierPicker("add", view.add, view.remove);
+      } else if (row?.id === "mod-remove") {
+        this.openModifierPicker("remove", view.add, view.remove);
+      } else if (row?.id === "mod-apply") {
+        this.applyModifierDraft(view.add, view.remove);
+      }
+      this.tui.requestRender();
+    }
+  }
+
+  private handleModifierPickerInput(data: string): void {
+    const view = this.state.view;
+    if (view.kind !== "baseline-modify-picker") return;
+
+    if (matchesKey(data, Key.escape)) {
+      this.state.view = {
+        kind: "baseline-modify",
+        add: view.add,
+        remove: view.remove,
+        selected: view.operation === "add" ? 0 : 1,
+      };
+      this.state.status = `${view.operation === "add" ? "Add" : "Remove"} picker cancelled.`;
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const checked = uniquePreserveOrder(view.editor.confirmSelection());
+      this.applyModifierPicker(view.operation, checked, view.add, view.remove);
       this.tui.requestRender();
       return;
     }
@@ -630,14 +773,16 @@ class SettingsUiComponent implements Component {
     const options: SingleSelectOption[] =
       scope === "global"
         ? [
-            { id: "default", label: "Default - unrestricted (omit)" },
+            { id: "inherit", label: "Inherit - use Default (omit)" },
             { id: "unrestricted", label: "Unrestricted - write null" },
-            { id: "custom", label: "Custom - choose tools" },
+            { id: "exact", label: "Exact - choose tools" },
+            { id: "modify", label: "Modify - add and remove" },
           ]
         : [
             { id: "inherit", label: "Inherit - use Global or Default" },
             { id: "unrestricted", label: "Unrestricted - write null" },
-            { id: "custom", label: "Custom - choose tools" },
+            { id: "exact", label: "Exact - choose tools" },
+            { id: "modify", label: "Modify - add and remove" },
           ];
     const active = activeScopeSnapshot(snap, scope);
     let selected = 0;
@@ -645,7 +790,8 @@ class SettingsUiComponent implements Component {
       const own = active.local.baseline;
       if (own.kind === "inherit") selected = 0;
       else if (own.kind === "unrestricted") selected = 1;
-      else selected = 2;
+      else if (own.kind === "list") selected = 2;
+      else selected = 3;
     }
     this.state.view = {
       kind: "baseline-mode",
@@ -660,26 +806,20 @@ class SettingsUiComponent implements Component {
     this.state.status = "Choose baseline mode.";
   }
 
-  private openBaselineEditor(): void {
-    const snap = this.state.session.snapshot();
-    const scopeSnap = activeScopeSnapshot(snap, this.state.scope);
-    // Seed custom editor from own list, else resolved list, else empty.
-    let seed: readonly string[] = [];
-    if (
-      scopeSnap.kind === "ready" &&
-      scopeSnap.local.baseline.kind === "list"
-    ) {
-      seed = scopeSnap.local.baseline.tools;
-    } else if (snap.effectiveBaseline.kind === "list") {
-      seed = snap.effectiveBaseline.tools;
-    }
-    const selected = new Set(seed);
+  private buildToolPickerItems(
+    checked: readonly string[],
+    extraNames: readonly string[] = [],
+  ): import("./ui/fuzzy-multi-selector.js").MultiSelectItem[] {
+    const selected = new Set(checked);
     const registered = new Map(
       this.tools.map((t) => [t.name, t.description ?? ""] as const),
     );
-    const names = new Set<string>([...registered.keys(), ...selected]);
-
-    const items = [...names]
+    const names = new Set<string>([
+      ...registered.keys(),
+      ...selected,
+      ...extraNames,
+    ]);
+    return [...names]
       .sort((a, b) => a.localeCompare(b))
       .map((name) => {
         const item: import("./ui/fuzzy-multi-selector.js").MultiSelectItem = {
@@ -691,17 +831,76 @@ class SettingsUiComponent implements Component {
         if (!registered.has(name)) item.badge = "unavailable";
         return item;
       });
+  }
+
+  private openBaselineEditor(): void {
+    const snap = this.state.session.snapshot();
+    const scopeSnap = activeScopeSnapshot(snap, this.state.scope);
+    let seed: readonly string[] = [];
+    if (
+      scopeSnap.kind === "ready" &&
+      scopeSnap.local.baseline.kind === "list"
+    ) {
+      seed = scopeSnap.local.baseline.tools;
+    } else if (snap.effectiveBaseline.kind === "exact") {
+      seed = snap.effectiveBaseline.tools;
+    }
 
     this.state.view = {
       kind: "baseline",
       editor: new FuzzyMultiSelector(
-        `Baseline tools (${this.state.scope})`,
-        items,
+        `Exact baseline tools (${this.state.scope})`,
+        this.buildToolPickerItems(seed),
         this.theme,
         10,
       ),
     };
-    this.state.status = "Editing baseline tools.";
+    this.state.status = "Editing exact baseline tools.";
+  }
+
+  private openModifierDraft(): void {
+    const snap = this.state.session.snapshot();
+    const scopeSnap = activeScopeSnapshot(snap, this.state.scope);
+    let add: string[] = [];
+    let remove: string[] = [];
+    if (
+      scopeSnap.kind === "ready" &&
+      scopeSnap.local.baseline.kind === "modify"
+    ) {
+      add = [...scopeSnap.local.baseline.add];
+      remove = [...scopeSnap.local.baseline.remove];
+    }
+    this.state.view = {
+      kind: "baseline-modify",
+      add,
+      remove,
+      selected: 0,
+    };
+    this.state.status =
+      add.length === 0 && remove.length === 0
+        ? "New modification. Add and Remove start empty."
+        : "Editing saved modification.";
+  }
+
+  private openModifierPicker(
+    operation: "add" | "remove",
+    add: readonly string[],
+    remove: readonly string[],
+  ): void {
+    const checked = operation === "add" ? add : remove;
+    this.state.view = {
+      kind: "baseline-modify-picker",
+      operation,
+      add: [...add],
+      remove: [...remove],
+      editor: new FuzzyMultiSelector(
+        `${operation === "add" ? "Add" : "Remove"} tools (${this.state.scope})`,
+        this.buildToolPickerItems(checked, [...add, ...remove]),
+        this.theme,
+        10,
+      ),
+    };
+    this.state.status = `Select tools to ${operation}.`;
   }
 
   private openBackendPicker(): void {
@@ -791,8 +990,12 @@ class SettingsUiComponent implements Component {
   // ---- apply edits ----------------------------------------------------
 
   private applyBaselineMode(id: string): void {
-    if (id === "custom") {
+    if (id === "exact" || id === "custom") {
       this.openBaselineEditor();
+      return;
+    }
+    if (id === "modify") {
+      this.openModifierDraft();
       return;
     }
 
@@ -814,7 +1017,7 @@ class SettingsUiComponent implements Component {
     } else {
       this.state.status =
         this.state.scope === "global"
-          ? "Global baseline set to Default."
+          ? "Global baseline set to Inherit (Default)."
           : "Project baseline set to Inherit.";
     }
   }
@@ -826,7 +1029,67 @@ class SettingsUiComponent implements Component {
       baseline: { kind: "list", tools },
     });
     if (result.kind !== "applied") return;
-    this.state.status = `Baseline set on ${this.state.scope} (${tools.length} tools).`;
+    this.state.status = `Exact baseline set on ${this.state.scope} (${tools.length} tools).`;
+  }
+
+  private applyModifierPicker(
+    operation: "add" | "remove",
+    checked: readonly string[],
+    previousAdd: readonly string[],
+    previousRemove: readonly string[],
+  ): void {
+    let add = [...previousAdd];
+    let remove = [...previousRemove];
+    let moved: string[] = [];
+    if (operation === "add") {
+      add = uniquePreserveOrder(checked);
+      moved = add.filter((name) => remove.includes(name));
+      remove = remove.filter((name) => !add.includes(name));
+    } else {
+      remove = uniquePreserveOrder(checked);
+      moved = remove.filter((name) => add.includes(name));
+      add = add.filter((name) => !remove.includes(name));
+    }
+    this.state.view = {
+      kind: "baseline-modify",
+      add,
+      remove,
+      selected: operation === "add" ? 0 : 1,
+    };
+    if (moved.length > 0) {
+      const from = operation === "add" ? "Remove" : "Add";
+      const to = operation === "add" ? "Add" : "Remove";
+      this.state.status = `Moved ${moved.join(", ")} from ${from} to ${to}.`;
+    } else {
+      this.state.status = `Updated ${operation === "add" ? "Add" : "Remove"} list.`;
+    }
+  }
+
+  private applyModifierDraft(
+    add: readonly string[],
+    remove: readonly string[],
+  ): void {
+    const nextAdd = uniquePreserveOrder(add);
+    const nextRemove = uniquePreserveOrder(remove).filter(
+      (name) => !nextAdd.includes(name),
+    );
+    const baseline: BaselineSelection =
+      nextAdd.length === 0 && nextRemove.length === 0
+        ? { kind: "inherit" }
+        : { kind: "modify", add: nextAdd, remove: nextRemove };
+    const result = this.apply({
+      type: "set-baseline",
+      scope: this.state.scope,
+      baseline,
+    });
+    if (result.kind !== "applied") return;
+    this.state.view = { kind: "main" };
+    this.state.status =
+      baseline.kind === "inherit"
+        ? this.state.scope === "global"
+          ? "Empty modification became Inherit (Default)."
+          : "Empty modification became Inherit."
+        : `${this.state.scope} modification: ${formatModifyLists(nextAdd, nextRemove)}.`;
   }
 
   private applyBackendChoice(id: string): void {
@@ -888,6 +1151,7 @@ class SettingsUiComponent implements Component {
   // ---- save -----------------------------------------------------------
 
   private save(): void {
+    const before = this.state.session.snapshot();
     const result = this.state.session.save();
 
     if (saveSucceeded(result)) {
@@ -895,7 +1159,16 @@ class SettingsUiComponent implements Component {
       this.onConfigSaved?.();
     }
 
-    this.state.status = formatSaveStatus(result);
+    let status = formatSaveStatus(result);
+    if (saveSucceeded(result)) {
+      const after = this.state.session.snapshot();
+      if (
+        !resolvedPolicyEqual(before.effectiveBaseline, after.effectiveBaseline)
+      ) {
+        status = `${status} Use /toolbelt reset to apply the baseline to this session.`;
+      }
+    }
+    this.state.status = status;
     this.tui.requestRender();
   }
 
@@ -989,20 +1262,21 @@ class SettingsUiComponent implements Component {
     const ownBase = local.baseline;
     const ownSearch = local.search;
 
-    // Baseline display — unrestricted shown distinctly from list membership.
-    // When local is inherit, pair effective value with its actual effective source
-    // (including Project when Project is the source). Do not hardcode Default
-    // for the Global tab.
+    const chain = formatBaselineTrace(snap.effectiveBaseline);
+    const effectiveText = formatResolvedBaseline(snap.effectiveBaseline);
     let baselineValue: string;
     let baselineSource: ValueSourceLabel;
-    let baselineNote: string | undefined;
+    let baselineNote: string;
     if (ownBase.kind !== "inherit") {
       baselineValue = formatBaselineSelection(ownBase);
       baselineSource = scopeId === "global" ? "Global" : "Project";
+      baselineNote = `effective ${effectiveText} · ${chain}`;
     } else {
-      baselineValue = formatResolvedBaseline(snap.effectiveBaseline);
-      baselineSource = sourceLabel(snap.effectiveBaseline.source);
-      baselineNote = `(inherited from ${baselineSource})`;
+      baselineValue = effectiveText;
+      const last =
+        snap.effectiveBaseline.trace[snap.effectiveBaseline.trace.length - 1];
+      baselineSource = sourceLabelFromTrace(last?.scope);
+      baselineNote = `(inherited) ${chain}`;
     }
 
     // Search display — same inherit parity as baseline.

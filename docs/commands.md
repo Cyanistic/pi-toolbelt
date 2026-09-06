@@ -9,7 +9,7 @@ Bare `/toolbelt` (no subcommand) prints:
 - `/toolbelt settings` - edit persistent configuration
 - `/toolbelt tools` - inspect and change session tools
 - `/toolbelt status` - show current state
-- `/toolbelt reset` - restore baseline (list) or activate all registered tools (unrestricted)
+- `/toolbelt reset` - restore the resolved baseline (exact set, or all registered except removals)
 
 Unknown subcommands are rejected with the valid list.
 
@@ -19,12 +19,14 @@ Opens the dual-scope settings editor (global + project).
 
 - Shows scope state: missing, valid, invalid, or ignored (untrusted project).
 - Known settings show whether the effective value is Default, Global, or Project.
-- Baseline modes: Global Default | Unrestricted | Custom; Project Inherit | Unrestricted | Custom. See [config.md](config.md#settings-write-table).
-- Search distinguishes default BM25 from an explicit BM25 or LLM selection.
-- Invalid scopes are read-only; exact path validation errors are shown; the file is never overwritten from settings.
+- Baseline modes for both scopes: Inherit, Unrestricted, Exact, Modify. Global Inherit uses Default; Project Inherit uses Global or Default. See [config.md](config.md#settings-write-table).
+- Modify opens a draft with separate Add and Remove pickers. Conflicts move to the latest operation. Empty confirmation becomes Inherit.
+- Baseline rows show the local value, the ordered Default → Global → Project chain, and the effective exact or unrestricted result. Replacement steps stay visible.
+- Search distinguishes default BM25 from an explicit BM25 or LLM selection and still reports a single source.
+- Invalid scopes are read-only; exact path validation errors are shown; the file is never overwritten from settings. Invalid modifiers (empty, empty names, unknown fields, add/remove overlap) are included.
 - Other valid scopes remain editable even when a sibling scope is malformed; config-driven runtime stays disabled until every participating scope is valid.
 - Dirty-draft discard is confirmed outside the editor loop.
-- On successful save: effective config reloads for discovery; **active tools are not mutated** and no session snapshot is written solely because baseline changed.
+- On successful save: effective config reloads for discovery; **active tools are not mutated** and no session snapshot is written solely because baseline changed. After a changed baseline, settings points at `/toolbelt reset` as the immediate apply action.
 
 ## `/toolbelt tools`
 
@@ -41,7 +43,7 @@ Reports runtime mode and membership. Distinguishes:
 
 | Mode | When | Status highlights |
 |---|---|---|
-| **configured** | No participating scope invalid (includes both files missing) | `Toolbelt: configured`; config paths or `(none - using defaults)`; baseline unrestricted or list with source; search BM25/LLM with source; optional session snapshot present |
+| **configured** | No participating scope invalid (includes both files missing) | `Toolbelt: configured`; config paths or `(none - using defaults)`; exact or unrestricted baseline plus the ordered contribution chain; search BM25/LLM with source; optional session snapshot present |
 | **session-only** | Participating config malformed **and** valid active-tool snapshot | `Toolbelt: session-only (config invalid)`; errors; tools remain via snapshot; search forced BM25 (session-only) |
 | **inactive** | Config unusable **and** no snapshot | `Toolbelt: inactive (config invalid)`; errors; points at `/toolbelt settings` or `/toolbelt tools` |
 
@@ -66,18 +68,18 @@ When enabled:
 
 | Effective baseline | Target set |
 |---|---|
-| **list** | Registered subset of the configured allowlist |
-| **unrestricted** | Every currently registered tool name |
+| **exact** | Registered subset of the final exact set |
+| **unrestricted** | Every currently registered tool except names in the final removal set |
 
 Flow:
 
 1. Diff current active set vs target (additions, removals, final count).
 2. No-op if already equal → report no change; no prompt; no extra snapshot.
-3. Otherwise confirm with preview (target label, add/remove, final count, baseline kind + source).
+3. Otherwise confirm with preview (target label, add/remove, final count, effective policy, contribution chain).
 4. On confirm: persist complete target set, then apply. Abort without mutation if persist fails.
 5. Cancel → no snapshot, active set unchanged.
 
-Unrestricted reset can re-enable tools another extension expected off; it is an explicit user action over the full registered catalog at invoke time.
+Unrestricted reset can re-enable tools another extension expected off; it is an explicit user action over the registered catalog at invoke time, minus final baseline removals.
 
 ## Model-facing tools
 

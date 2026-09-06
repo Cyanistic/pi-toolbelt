@@ -11,6 +11,11 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import {
+  computeResetTarget,
+  formatBaselineTrace,
+  formatResolvedBaseline,
+} from "./baseline.js";
+import {
   buildEffectiveConfig,
   configErrorMessages,
   hasConfigError,
@@ -19,7 +24,6 @@ import {
 } from "./config.js";
 import { LOADER_TOOL_NAME } from "./constants.js";
 import {
-  filterRegisteredTools,
   hasActiveToolSnapshot,
   isDiscoveryReceipt,
   persistActiveTools,
@@ -78,7 +82,7 @@ export async function handleToolbeltCommand(
           "  /toolbelt settings  - edit persistent configuration\n" +
           "  /toolbelt tools     - inspect and change session tools\n" +
           "  /toolbelt status    - show current state\n" +
-          "  /toolbelt reset     - restore baseline (list) or activate all registered tools (unrestricted)",
+          "  /toolbelt reset     - restore the resolved baseline (exact set, or all registered except removals)",
         "info",
       );
       break;
@@ -246,11 +250,6 @@ async function handleStatus(
         ? `LLM (model: ${effective.search.model ?? "inherit active"})`
         : "BM25 (local)";
 
-    const baselineDesc =
-      effective.baseline.kind === "unrestricted"
-        ? "unrestricted"
-        : effective.baseline.tools.join(", ") || "(none)";
-
     lines.push("Toolbelt: configured");
     if (configPaths.length > 0) {
       lines.push(`Config: ${configPaths.join(", ")}`);
@@ -259,9 +258,8 @@ async function handleStatus(
       lines.push("Config: (none - using defaults)");
       lines.push("Source: none");
     }
-    lines.push(
-      `Baseline: ${baselineDesc} (source: ${effective.baseline.source})`,
-    );
+    lines.push(`Baseline: ${formatResolvedBaseline(effective.baseline)}`);
+    lines.push(`Baseline chain: ${formatBaselineTrace(effective.baseline)}`);
     lines.push(`Search: ${searchDesc} (source: ${effective.searchSource})`);
     if (runtime.hasSnapshot) {
       lines.push("Session snapshot: present");
@@ -367,11 +365,8 @@ async function handleReset(
     return;
   }
 
-  // List baseline → filtered allowlist; unrestricted → all currently registered.
-  const target =
-    effective.baseline.kind === "list"
-      ? filterRegisteredTools(pi, effective.baseline.tools)
-      : pi.getAllTools().map((tool) => tool.name);
+  const registeredNames = pi.getAllTools().map((tool) => tool.name);
+  const target = computeResetTarget(effective.baseline, registeredNames);
   const before = pi.getActiveTools();
   const beforeSet = new Set(before);
   const afterSet = new Set(target);
@@ -387,9 +382,11 @@ async function handleReset(
   }
 
   const targetLabel =
-    effective.baseline.kind === "list"
-      ? "configured list baseline"
-      : "all currently registered tools (unrestricted baseline)";
+    effective.baseline.kind === "exact"
+      ? "configured exact baseline"
+      : effective.baseline.remove.length > 0
+        ? "all currently registered tools except baseline removals"
+        : "all currently registered tools (unrestricted baseline)";
   const previewLines = [
     `Reset active tools to ${targetLabel}?`,
     "",
@@ -397,7 +394,8 @@ async function handleReset(
     removed.length > 0 ? `Remove: ${removed.join(", ")}` : "Remove: (none)",
     `Final active count: ${target.length}`,
     "",
-    `Baseline: ${effective.baseline.kind} (source: ${effective.baseline.source})`,
+    `Baseline: ${formatResolvedBaseline(effective.baseline)}`,
+    `Baseline chain: ${formatBaselineTrace(effective.baseline)}`,
   ];
 
   const confirmed = await ctx.ui.confirm(

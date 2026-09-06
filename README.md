@@ -19,7 +19,7 @@ Install alone is enough for discovery and management. No `toolbelt.json` is requ
 | `/toolbelt settings` | Edit global/project config in TUI |
 | `/toolbelt tools` | Inspect and change the session active set |
 | `/toolbelt status` | Runtime mode, baseline, search, active names, last discovery receipt |
-| `/toolbelt reset` | Restore list baseline, or activate every currently registered tool when unrestricted |
+| `/toolbelt reset` | Restore the resolved baseline: exact set, or all registered tools except removals |
 
 Bare `/toolbelt` lists these subcommands. Settings and tools require TUI mode.
 
@@ -46,18 +46,21 @@ One direction per call (`activate` or `deactivate`), exact registered names only
 
 ### Baseline semantics
 
-`baseline` is optional on each config scope:
+`baseline` is optional on each config scope. Layers apply in order: Default → Global → trusted Project.
 
 | Value | Meaning |
 |---|---|
-| omitted | Inherit parent; full chain → unrestricted (root default) |
-| `null` | Explicit unrestricted (all tools; no `setActiveTools` on new session) |
-| `string[]` | Exact allowlist applied on new session / list reset |
-| `[]` | Allowlist of zero tools (not unrestricted) |
+| omitted | Keep inherited state; full chain omitted → unrestricted Default |
+| `null` | Replace inherited state with unrestricted |
+| `string[]` | Replace inherited state with that exact set |
+| `[]` | Exact set of zero tools (not unrestricted) |
+| `{ "type": "modify", "add"?: string[], "remove"?: string[] }` | Add and/or remove names from inherited state |
 
-On new session (or resume without a valid snapshot): a **list** baseline calls `setActiveTools` with the registered subset; **unrestricted** leaves the host active set alone. Resume with a valid snapshot restores that snapshot first, even when config is missing or malformed.
+On a new session (or resume without a valid snapshot): an **exact** policy clamps to the registered subset; **unrestricted** with no add/remove leaves the host set alone; unrestricted **modify** changes only the named tools. Resume with a valid snapshot restores that snapshot first, even when config is missing or malformed.
 
-`/toolbelt reset` restores a list baseline, or targets every currently registered tool when unrestricted. Confirm + persist-first; no-op when already at the target.
+`/toolbelt reset` restores the exact set, or every currently registered tool except final unrestricted removals. Confirm + persist-first; no-op when already at the target. Settings save does not apply a new baseline to the current session; use reset for that.
+
+An older Toolbelt release treats `modify` objects as invalid. Replace them with omitted, `null`, or an array before downgrading.
 
 ### Runtime modes
 
@@ -91,13 +94,19 @@ On new session (or resume without a valid snapshot): a **list** baseline calls `
 }
 ```
 
+```json
+{
+  "baseline": { "type": "modify", "add": ["grep"], "remove": ["bash"] }
+}
+```
+
 Empty `{}` is valid and resolves through defaults. Unknown fields are ignored at runtime and preserved by settings saves.
 
 ## Docs
 
 | Doc | Contents |
 |---|---|
-| [docs/config.md](docs/config.md) | File shape, omit / null / array / `[]`, inheritance, trust |
+| [docs/config.md](docs/config.md) | File shape, omit / null / array / `modify`, inheritance, trust |
 | [docs/commands.md](docs/commands.md) | Slash commands, tools, status, reset |
 | [docs/behavior.md](docs/behavior.md) | Session start, snapshots, runtime modes, discovery receipts |
 

@@ -44,13 +44,37 @@ export type SearchConfig = Static<typeof SearchConfigSchema>;
 // Config
 // ---------------------------------------------------------------------------
 
+const ToolNameSchema = Type.String({ minLength: 1 });
+const ToolNameListSchema = Type.Array(ToolNameSchema);
+
+/**
+ * Tagged baseline modifier. Unknown fields and empty names are rejected.
+ * At least one of `add` or `remove` must be a non-empty list. Cross-list
+ * overlap is rejected after this schema at the configuration boundary.
+ */
+export const BaselineModifySchema = Type.Refine(
+  Type.Object(
+    {
+      type: Type.Literal("modify"),
+      add: Type.Optional(ToolNameListSchema),
+      remove: Type.Optional(ToolNameListSchema),
+    },
+    { additionalProperties: false },
+  ),
+  (value) =>
+    (value.add !== undefined && value.add.length > 0) ||
+    (value.remove !== undefined && value.remove.length > 0),
+  () => 'modify must include a non-empty "add" or "remove" list',
+);
+
 /**
  * Scope baseline: JSON null = unrestricted; string[] (including empty) =
- * exact allowlist. Omitted inherits parent / root unrestricted default.
+ * exact allowlist; tagged modify adds/removes names. Omitted inherits.
  */
 export const BaselineConfigSchema = Type.Union([
   Type.Null(),
   Type.Array(Type.String()),
+  BaselineModifySchema,
 ]);
 
 /** Full validated toolbelt.json shape after defaults are applied. */

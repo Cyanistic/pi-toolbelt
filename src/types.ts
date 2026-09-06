@@ -26,19 +26,28 @@ import type {
 // Resolved baseline (effective config)
 // ---------------------------------------------------------------------------
 
-/** Which scope (or root default) contributed the effective baseline. */
-export type BaselineSource = "default" | "global" | "project";
+/** One contributing operation in Default → Global → Project order. */
+export interface BaselineTraceStep {
+  readonly scope: string;
+  readonly summary: string;
+}
 
 /**
  * Effective baseline as a tagged union so unrestricted cannot be confused
- * with an empty allowlist.
+ * with an empty allowlist. Unrestricted retains explicit add/remove overlays
+ * so startup can change named tools without synthesizing an exact list.
  */
 export type ResolvedBaseline =
-  | { readonly kind: "unrestricted"; readonly source: BaselineSource }
   | {
-      readonly kind: "list";
+      readonly kind: "unrestricted";
+      readonly add: readonly string[];
+      readonly remove: readonly string[];
+      readonly trace: readonly BaselineTraceStep[];
+    }
+  | {
+      readonly kind: "exact";
       readonly tools: readonly string[];
-      readonly source: BaselineSource;
+      readonly trace: readonly BaselineTraceStep[];
     };
 
 // ---------------------------------------------------------------------------
@@ -87,7 +96,7 @@ export type ConfigSource =
 
 /** Resolved configuration combining trusted global + project sources. */
 export interface EffectiveConfig {
-  /** Effective baseline: unrestricted or exact allowlist, with source. */
+  /** Effective baseline: exact set or unrestricted overlay, with trace. */
   readonly baseline: ResolvedBaseline;
   readonly search: SearchConfig;
   /** Which scopes contributed known config (valid only). */

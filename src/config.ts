@@ -23,6 +23,12 @@ import {
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
+import {
+  isBaselineModify,
+  overlappingModifyNames,
+  resolveBaselineLayers,
+  uniquePreserveOrder,
+} from "./baseline.js";
 import { CONFIG_FILE_NAME } from "./constants.js";
 import { ToolbeltConfigFileSchema } from "./schemas.js";
 import type {
@@ -104,9 +110,57 @@ const toolbeltConfigFileValidator = Compile(ToolbeltConfigFileSchema);
 /**
  * Map TypeBox validation errors onto stable user-facing wording.
  */
+function describeBaselineConfigError(value: unknown, path: string): string {
+  if (Array.isArray(value)) {
+    if (value.some((entry) => typeof entry !== "string")) {
+      return `${path}: 'baseline' entries must be strings`;
+    }
+    return `${path}: 'baseline' must be null, an array of tool names, or a { "type": "modify" } object`;
+  }
+  if (typeof value !== "object" || value === null) {
+    return `${path}: 'baseline' must be null, an array of tool names, or a { "type": "modify" } object`;
+  }
+
+  const obj = value as Record<string, unknown>;
+  if (obj["type"] !== "modify") {
+    return `${path}: 'baseline' modify object must set "type" to "modify"`;
+  }
+
+  const unknown = Object.keys(obj).filter(
+    (key) => key !== "type" && key !== "add" && key !== "remove",
+  );
+  if (unknown[0] !== undefined) {
+    return `${path}: 'baseline' modify object has unknown field '${unknown[0]}'`;
+  }
+
+  const add = obj["add"];
+  const remove = obj["remove"];
+  if (add !== undefined && !Array.isArray(add)) {
+    return `${path}: 'baseline' modify "add" must be an array of tool names`;
+  }
+  if (remove !== undefined && !Array.isArray(remove)) {
+    return `${path}: 'baseline' modify "remove" must be an array of tool names`;
+  }
+
+  const addList = Array.isArray(add) ? add : [];
+  const removeList = Array.isArray(remove) ? remove : [];
+  if (
+    addList.some((name) => typeof name !== "string" || name.length === 0) ||
+    removeList.some((name) => typeof name !== "string" || name.length === 0)
+  ) {
+    return `${path}: 'baseline' modify names must be non-empty strings`;
+  }
+  if (addList.length === 0 && removeList.length === 0) {
+    return `${path}: 'baseline' modify must include a non-empty "add" or "remove" list`;
+  }
+
+  return `${path}: 'baseline' must be null, an array of tool names, or a { "type": "modify" } object`;
+}
+
 function mapToolbeltConfigError(
   errors: readonly { instancePath: string; message?: string }[],
   path: string,
+  raw: Record<string, unknown>,
 ): string {
   const error = errors[0];
   if (error === undefined) {
@@ -114,15 +168,20 @@ function mapToolbeltConfigError(
   }
 
   const { instancePath } = error;
-
-  if (instancePath === "/baseline") {
-    return `${path}: 'baseline' must be null or an array of tool names`;
-  }
-  if (instancePath.startsWith("/baseline/")) {
-    return `${path}: 'baseline' entries must be strings`;
+  if (instancePath === "/baseline" || instancePath.startsWith("/baseline/")) {
+    return describeBaselineConfigError(raw["baseline"], path);
   }
   if (instancePath === "/search" || instancePath.startsWith("/search/")) {
     return `${path}: 'search' must be { "type": "bm25" } or { "type": "llm" } with optional model`;
+  }
+  if (Object.hasOwn(raw, "baseline")) {
+    const baselineMessage = describeBaselineConfigError(raw["baseline"], path);
+    if (
+      baselineMessage !==
+      `${path}: 'baseline' must be null, an array of tool names, or a { "type": "modify" } object`
+    ) {
+      return baselineMessage;
+    }
   }
 
   return `${path}: invalid toolbelt configuration`;
@@ -143,6 +202,7 @@ function validateConfig(
       error: mapToolbeltConfigError(
         toolbeltConfigFileValidator.Errors(raw),
         path,
+        raw,
       ),
     };
   }
@@ -151,7 +211,25 @@ function validateConfig(
   // Decode them once into LocalConfig; retain raw only for round-trip.
   const fields: ScopeKnownFields = {};
   if (raw.baseline !== undefined) {
-    fields.baseline = raw.baseline as BaselineConfig;
+    const baseline = raw.baseline as BaselineConfig;
+    if (isBaselineModify(baseline)) {
+      const add = uniquePreserveOrder(baseline.add ?? []);
+      const remove = uniquePreserveOrder(baseline.remove ?? []);
+      const overlap = overlappingModifyNames(add, remove);
+      if (overlap[0] !== undefined) {
+        return {
+          state: "invalid",
+          path,
+          error: `${path}: 'baseline' modify cannot list '${overlap[0]}' in both add and remove`,
+        };
+      }
+      const normalized: BaselineConfig = { type: "modify" };
+      if (add.length > 0) normalized.add = add;
+      if (remove.length > 0) normalized.remove = remove;
+      fields.baseline = normalized;
+    } else {
+      fields.baseline = baseline;
+    }
   }
   if (raw.search !== undefined) {
     fields.search = raw.search as SearchConfig;
@@ -238,11 +316,16 @@ function toPublicSource(source: ProjectConfigSource): ConfigSource {
 
 export type ConfigScopeId = "global" | "project";
 
-/** Scope-local baseline: inherit/omit, unrestricted (null), or exact list. */
+/** Scope-local baseline: inherit/omit, unrestricted (null), exact list, or modify. */
 export type BaselineSelection =
   | { readonly kind: "inherit" }
   | { readonly kind: "unrestricted" }
-  | { readonly kind: "list"; readonly tools: readonly string[] };
+  | { readonly kind: "list"; readonly tools: readonly string[] }
+  | {
+      readonly kind: "modify";
+      readonly add: readonly string[];
+      readonly remove: readonly string[];
+    };
 
 /** LLM model selection within a search override. */
 export type SearchModelSelection =
@@ -366,7 +449,12 @@ export interface ConfigEditorSession {
 function decodeBaseline(value: BaselineConfig | undefined): BaselineSelection {
   if (value === undefined) return { kind: "inherit" };
   if (value === null) return { kind: "unrestricted" };
-  return { kind: "list", tools: [...value] };
+  if (Array.isArray(value)) return { kind: "list", tools: [...value] };
+  return {
+    kind: "modify",
+    add: uniquePreserveOrder(value.add ?? []),
+    remove: uniquePreserveOrder(value.remove ?? []),
+  };
 }
 
 function decodeSearch(value: SearchConfig | undefined): SearchSelection {
@@ -376,6 +464,22 @@ function decodeSearch(value: SearchConfig | undefined): SearchSelection {
     return { kind: "llm", model: { kind: "named", id: value.model } };
   }
   return { kind: "llm", model: { kind: "active" } };
+}
+
+function normalizeBaselineSelection(
+  baseline: BaselineSelection,
+): BaselineSelection {
+  if (baseline.kind === "list") {
+    return { kind: "list", tools: uniquePreserveOrder(baseline.tools) };
+  }
+  if (baseline.kind !== "modify") return baseline;
+  const add = uniquePreserveOrder(baseline.add);
+  const overlap = new Set(overlappingModifyNames(add, baseline.remove));
+  const remove = uniquePreserveOrder(baseline.remove).filter(
+    (name) => !overlap.has(name),
+  );
+  if (add.length === 0 && remove.length === 0) return { kind: "inherit" };
+  return { kind: "modify", add, remove };
 }
 
 function decodeLocal(fields: ScopeKnownFields): LocalConfig {
@@ -395,6 +499,17 @@ function encodeBaseline(
       return null;
     case "list":
       return [...selection.tools];
+    case "modify": {
+      const add = uniquePreserveOrder(selection.add);
+      const remove = uniquePreserveOrder(selection.remove);
+      if (add.length === 0 && remove.length === 0) return undefined;
+      const encoded: Extract<BaselineConfig, { type: "modify" }> = {
+        type: "modify",
+      };
+      if (add.length > 0) encoded.add = add;
+      if (remove.length > 0) encoded.remove = remove;
+      return encoded;
+    }
   }
 }
 
@@ -423,8 +538,8 @@ function knownFieldsFromLocal(local: LocalConfig): ScopeKnownFields {
 
 /**
  * Encode semantic baseline onto a private raw template.
- * inherit → omit key; unrestricted → null; list → string[].
- * Unknown top-level siblings are preserved.
+ * inherit → omit key; unrestricted → null; list → string[];
+ * modify → tagged object. Unknown top-level siblings are preserved.
  */
 function encodeBaselineOnRaw(
   raw: Record<string, unknown>,
@@ -486,26 +601,19 @@ function emptyDocument(): ConfigDocument {
 // Shared inheritance (persisted sources and editor semantic drafts)
 // ---------------------------------------------------------------------------
 
-/**
- * Map a present scope baseline (null | string[]) onto ResolvedBaseline.
- * Callers must only pass defined values; omit is handled by inheritance.
- */
-function resolveBaselineValue(
-  value: BaselineConfig,
-  source: "global" | "project",
-): ResolvedBaseline {
-  if (value === null) {
-    return { kind: "unrestricted", source };
-  }
-  return { kind: "list", tools: [...value], source };
+function baselineLayer(
+  label: string,
+  value: BaselineConfig | undefined,
+): import("./baseline.js").BaselineLayer {
+  return value === undefined ? { label } : { label, value };
 }
 
 /**
  * Single inheritance implementation for runtime files and editor drafts.
  *
- * Project fields override Global; omitted keys fall through; search objects
- * replace as units. Undefined scope arguments mean the scope does not
- * contribute values (missing, invalid, ignored, removed, or untrusted).
+ * Baseline folds Default → Global → trusted Project. Search objects replace
+ * as units. Undefined scope arguments mean the scope does not contribute
+ * values (missing, invalid, ignored, removed, or untrusted).
  */
 function resolveInheritance(
   globalFields: ScopeKnownFields | undefined,
@@ -515,19 +623,13 @@ function resolveInheritance(
   search: SearchConfig;
   searchSource: "default" | "global" | "project";
 } {
-  const baselineFromProject = projectFields?.baseline;
-  const baselineFromGlobal = globalFields?.baseline;
   const searchFromProject = projectFields?.search;
   const searchFromGlobal = globalFields?.search;
 
-  let baseline: ResolvedBaseline;
-  if (baselineFromProject !== undefined) {
-    baseline = resolveBaselineValue(baselineFromProject, "project");
-  } else if (baselineFromGlobal !== undefined) {
-    baseline = resolveBaselineValue(baselineFromGlobal, "global");
-  } else {
-    baseline = { kind: "unrestricted", source: "default" };
-  }
+  const baseline = resolveBaselineLayers([
+    baselineLayer("Global", globalFields?.baseline),
+    baselineLayer("Project", projectFields?.baseline),
+  ]);
 
   let searchSource: "default" | "global" | "project" = "default";
   let search: SearchConfig;
@@ -769,15 +871,25 @@ function privateSourceToProjectState(
   return privateSourceToGlobalState(source);
 }
 
+function cloneBaseline(baseline: BaselineSelection): BaselineSelection {
+  if (baseline.kind === "list") {
+    return { kind: "list", tools: [...baseline.tools] };
+  }
+  if (baseline.kind === "modify") {
+    return {
+      kind: "modify",
+      add: [...baseline.add],
+      remove: [...baseline.remove],
+    };
+  }
+  return { ...baseline };
+}
+
 function cloneDocument(document: ConfigDocument): ConfigDocument {
-  const baseline = document.local.baseline;
   const search = document.local.search;
   return {
     local: {
-      baseline:
-        baseline.kind === "list"
-          ? { kind: "list", tools: [...baseline.tools] }
-          : { ...baseline },
+      baseline: cloneBaseline(document.local.baseline),
       search:
         search.kind === "llm" && search.model.kind === "named"
           ? { kind: "llm", model: { kind: "named", id: search.model.id } }
@@ -1027,7 +1139,10 @@ class ConfigEditorSessionImpl implements ConfigEditorSession {
     }
 
     const document = cloneDocument(current.document);
-    document.local = { ...document.local, baseline };
+    document.local = {
+      ...document.local,
+      baseline: normalizeBaselineSelection(baseline),
+    };
 
     this.setScopeState(scope, {
       kind: "dirty",

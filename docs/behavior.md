@@ -17,7 +17,7 @@ else:
 
 | Mode | `query_tools` | `manage_tools` | `/toolbelt reset` | Baseline apply on session_start |
 |---|---|---|---|---|
-| configured | yes (config search) | yes | yes | list → `setActiveTools`; unrestricted → no call |
+| configured | yes (config search) | yes | yes | exact → clamp; unmodified unrestricted → no call; unrestricted with add/remove → named tools only |
 | session-only | yes (BM25 only) | yes | no | snapshot restore only when resume has snapshot; no baseline apply when config invalid |
 | inactive | refuse | refuse | no | no mutation |
 
@@ -34,19 +34,26 @@ On `session_start`:
    - `setActiveTools(filtered)`.
    - Snapshot wins even when config files are missing or participating config is malformed.
    - Stop (do not apply baseline).
-4. Else if configured **and** baseline `kind === "list"`:
-   - `setActiveTools(filterRegistered(baseline.tools))`.
-   - Empty list → empty registered subset (clears tools).
-5. Else (configured unrestricted, or config unusable without snapshot):
+4. Else if configured **and** the effective policy is exact:
+   - `setActiveTools(registered subset of the exact set)`.
+   - Empty exact set → empty registered subset (clears tools).
+5. Else if configured unrestricted **with** final additions or removals:
+   - Start from the current host active set.
+   - Activate registered names in `add`, deactivate registered names in `remove`.
+   - Leave every unrelated tool's membership unchanged.
+   - Call `setActiveTools` only when membership differs.
+   - Unavailable configured names stay in config and the chain; they are not applied.
+6. Else (unmodified unrestricted, or config unusable without snapshot):
    - **Do not** call `setActiveTools`. Host active set left unchanged.
 
 Implications:
 
 - Fresh install, no files, no snapshot → unrestricted; host set untouched; discovery/management available.
-- Explicit list baseline clamps a new session to the registered subset.
+- Exact baseline clamps a new session to the registered subset.
 - `baseline: null` → unrestricted; no clamp.
-- `baseline: []` → list of zero; new session zeros registered active tools.
-- Resume without snapshot follows the no-snapshot path above (list clamp or leave alone).
+- `baseline: []` → exact set of zero; new session zeros registered active tools.
+- Unrestricted `modify` changes only the named tools at startup.
+- Resume without snapshot follows the no-snapshot path above.
 
 ## Active-tool snapshots
 
@@ -84,15 +91,17 @@ Default parameters used when omitted: `includeActive=false`, `limit=5`, `timeout
 
 See [commands.md](commands.md#toolbelt-reset). Summary:
 
-- List baseline → registered subset of allowlist.
-- Unrestricted → all currently registered names (can re-enable tools other extensions expected off).
+- Exact policy → registered subset of the final exact set.
+- Unrestricted → every currently registered name except final removals. Explicit additions need no extra reset handling; they are already in the full registered target unless a later layer removed them.
+- A later add that reversed an earlier remove stays in the reset target.
 - Confirm when membership would change; persist-first; no-op short-circuit.
+- Manual activation through `manage_tools` and `/toolbelt tools` remains allowed for names a baseline removed.
 
 ## Trust boundary
 
 | Situation | Effect |
 |---|---|
-| Project trusted, defines baseline/search | Project values win over global for defined fields |
+| Project trusted, defines baseline/search | Baseline folds Default → Global → Project; search still replaces as a unit |
 | Project untrusted | Project file fully ignored; global or defaults apply |
 | Project untrusted + malformed project file | Project error ignored; defaults/global still enable configured mode without a snapshot |
 | Global LLM + untrusted project | Global LLM remains consent for egress |
