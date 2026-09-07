@@ -1,6 +1,6 @@
 {
   "name": "@cyanism/pi-toolbelt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Progressive tool discovery for Pi — carry only the tools you need",
   "type": "module",
   "files": [
