@@ -1,8 +1,55 @@
-# pi-toolbelt
+<div align="center">
+<img src="https://raw.githubusercontent.com/Cyanistic/pi-toolbelt/main/assets/pi-toolbelt.png" width="192" height="192" alt="pi-toolbelt: the Pi symbol wearing a belt with one wrench clipped on">
 
-Progressive tool discovery and explicit session tool management for [Pi](https://github.com/earendil-works/pi-coding-agent).
+**pi-toolbelt**
 
-Toolbelt keeps active-tool membership deliberate. The model discovers inactive tools through `query_tools`, activates or deactivates exact names through `manage_tools`, and resumes the original task with the updated active set. Hiding tools is opt-in: with no config, the baseline is unrestricted and discovery runs under BM25.
+Keep the tools you need. Leave the rest in a catalog the model can search.
+
+[What](#what-this-is) ·
+[Why](#why-use-it) ·
+[Install](#install) ·
+[Use](#how-to-use-it) ·
+[Docs](#docs)
+</div>
+
+## What this is
+
+A [Pi](https://github.com/earendil-works/pi-coding-agent) extension. It gives the model two extra abilities:
+
+1. Search tools that are not currently on (`query_tools`)
+2. Turn exact tools on or off for this session (`manage_tools`)
+
+You can do the same from the keyboard with `/toolbelt tools`. Settings live in `/toolbelt settings`.
+
+Install does **not** hide anything. Your current tools stay as they are until you choose a smaller set.
+
+Requires Pi `0.80.7` or newer.
+
+## Why use it
+
+Pi can load a lot of tools. A long list wastes context and makes the model worse at picking.
+
+Toolbelt keeps most tools in a catalog. The model searches, then clips on only what this task needs. You can also clip tools on and off yourself, live, without restarting.
+
+Do not install this if you wanted:
+
+- fewer tools with zero extra workflow (install leaves everything on)
+- search hits that turn themselves on (discovery never activates)
+- a `toolbelt.json` switch that unloads the extension (use `pi config` / packages for that)
+
+## See it
+
+The model finds a hidden tool and turns it on:
+
+https://github.com/user-attachments/assets/c3dc5dea-916a-4584-9567-eb76e7ec2e94
+
+You change the live set. The model’s next answer matches:
+
+https://github.com/user-attachments/assets/1bb004e2-3cb0-469d-9c06-0ee51b2788e2
+
+Settings: baseline, search backend, global vs project:
+
+https://github.com/user-attachments/assets/fce8efbe-e67a-4175-a7ee-736801a4241e
 
 ## Install
 
@@ -10,75 +57,47 @@ Toolbelt keeps active-tool membership deliberate. The model discovers inactive t
 pi install npm:@cyanism/pi-toolbelt
 ```
 
-Install alone is enough for discovery and management. No `toolbelt.json` is required for the happy path.
+No config file is required. Check that it loaded:
 
-## Commands
+```
+/toolbelt status
+```
 
-| Command | Purpose |
+You should see `Toolbelt: configured` and two extra tools, `query_tools` and `manage_tools`.
+
+Update with `pi update npm:@cyanism/pi-toolbelt`. Remove with `pi remove npm:@cyanism/pi-toolbelt`.
+
+## How to use it
+
+### You
+
+| Command | What it does |
 |---|---|
-| `/toolbelt settings` | Edit global/project config in TUI |
-| `/toolbelt tools` | Inspect and change the session active set |
-| `/toolbelt status` | Runtime mode, baseline, search, active names, last discovery receipt |
-| `/toolbelt reset` | Restore the resolved baseline: exact set, or all registered tools except removals |
+| `/toolbelt tools` | See every registered tool. Filter, Space to stage, Enter to apply. |
+| `/toolbelt settings` | Edit global and project config in the TUI. |
+| `/toolbelt status` | Mode, baseline, search, active names. |
+| `/toolbelt reset` | Put this session back to the configured baseline. |
 
-Bare `/toolbelt` lists these subcommands. Settings and tools require TUI mode.
+Bare `/toolbelt` lists these. Settings and tools need TUI mode.
 
-## How it works
+A typical first session: ask the model what tools it has, open `/toolbelt tools`, turn one off, ask again.
 
-### Discovery (`query_tools`)
+### The model
 
-Score-free ranked results with exact name, registered description, and active state. Searches inactive tools by default (hidden-first). Never mutates the active set.
+When a needed tool is missing, it should:
 
-Per-call controls:
+1. Call `query_tools` with the job to do (not a tool name)
+2. Call `manage_tools` with the exact name to activate
+3. Use that tool
 
-- `includeActive` (default `false`) - include already-active tools
-- `limit` (default `5`) - maximum results, no upper bound
-- `timeoutMs` (default `30000`) - LLM-ranking timeout in ms; `0` disables the mode timeout
+It should not guess names, and it should not expect search results to turn themselves on.
 
-### Search backends
+### Optional config
 
-- **BM25 (default, local):** MiniSearch over exact names and descriptions. Private, no metadata egress.
-- **LLM (opt-in, advisory):** When `search` is `{ "type": "llm" }`, the eligible catalog is sent to Pi’s active or configured model. Raw model text is returned without parsing. Falls back visibly to BM25 when the model is unavailable, times out, or returns blank output.
-
-### Activation (`manage_tools`)
-
-One direction per call (`activate` or `deactivate`), exact registered names only. The complete final active set is persisted as a session snapshot before every mutation. Any registered tool - including `query_tools` and `manage_tools` - may be deactivated.
-
-### Baseline semantics
-
-`baseline` is optional on each config scope. Layers apply in order: Default → Global → trusted Project.
-
-| Value | Meaning |
-|---|---|
-| omitted | Keep inherited state; full chain omitted → unrestricted Default |
-| `null` | Replace inherited state with unrestricted |
-| `string[]` | Replace inherited state with that exact set |
-| `[]` | Exact set of zero tools (not unrestricted) |
-| `{ "type": "modify", "add"?: string[], "remove"?: string[] }` | Add and/or remove names from inherited state |
-
-On a new session (or resume without a valid snapshot): an **exact** policy clamps to the registered subset; **unrestricted** with no add/remove leaves the host set alone; unrestricted **modify** changes only the named tools. Resume with a valid snapshot restores that snapshot first, even when config is missing or malformed.
-
-`/toolbelt reset` restores the exact set, or every currently registered tool except final unrestricted removals. Confirm + persist-first; no-op when already at the target. Settings save does not apply a new baseline to the current session; use reset for that.
-
-An older Toolbelt release treats `modify` objects as invalid. Replace them with omitted, `null`, or an array before downgrading.
-
-### Runtime modes
-
-- **configured** - no participating scope is invalid (including both files missing: unrestricted + BM25 defaults). Discovery, management, and reset available.
-- **session-only** - participating config malformed, but a valid active-tool snapshot exists. Discovery forced to BM25; management works; reset disabled.
-- **inactive** - config unusable and no snapshot. Discovery and management refuse until config is fixed or a session set is established via `/toolbelt tools`.
-
-### Trust and privacy
-
-- BM25 is fully local.
-- Global LLM search is explicit consent for catalog-metadata egress.
-- Project config (baseline, search, unknown fields, validation errors) is ignored while the project is untrusted (`ctx.isProjectTrusted()`). Global remains effective. An untrusted project-selected LLM is not used.
-- Extension disable remains a Pi host concern (`pi config` / packages), not a toolbelt.json kill switch.
-
-## Config paths
+Only if you want a smaller default set. Files:
 
 - Global: `~/.pi/agent/toolbelt.json`
-- Project: `.pi/toolbelt.json` (requires trust; `search` replaces global as a unit)
+- Project: `.pi/toolbelt.json` (Pi must trust the project)
 
 ```json
 {
@@ -87,29 +106,18 @@ An older Toolbelt release treats `modify` objects as invalid. Replace them with 
 }
 ```
 
-```json
-{
-  "baseline": null,
-  "search": { "type": "llm", "model": "openai/gpt-4" }
-}
-```
+Saving settings does not change the current session. Use `/toolbelt reset` for that.
 
-```json
-{
-  "baseline": { "type": "modify", "add": ["grep"], "remove": ["bash"] }
-}
-```
-
-Empty `{}` is valid and resolves through defaults. Unknown fields are ignored at runtime and preserved by settings saves.
+Search stays local (BM25) unless you opt into LLM search, which sends tool names and descriptions to a model.
 
 ## Docs
 
-| Doc | Contents |
-|---|---|
-| [docs/config.md](docs/config.md) | File shape, omit / null / array / `modify`, inheritance, trust |
-| [docs/commands.md](docs/commands.md) | Slash commands, tools, status, reset |
-| [docs/behavior.md](docs/behavior.md) | Session start, snapshots, runtime modes, discovery receipts |
+Full rules live in the repo, not on npm:
+
+- [Config](https://github.com/Cyanistic/pi-toolbelt/blob/main/docs/config.md) — file shape, inheritance, trust
+- [Commands](https://github.com/Cyanistic/pi-toolbelt/blob/main/docs/commands.md) — slash commands and model tools
+- [Behavior](https://github.com/Cyanistic/pi-toolbelt/blob/main/docs/behavior.md) — session start, snapshots, runtime modes
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
